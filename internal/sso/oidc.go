@@ -27,10 +27,18 @@ const oidcHTTPTimeout = 15 * time.Second
 // rebinding) and also covers the JWKS URL and token endpoint that the IdP
 // advertises via discovery — those are not validated upfront because we don't
 // see them until discovery runs.
+//
+// Outbound proxy: the transport honors HTTP(S)_PROXY / NO_PROXY via
+// utils.ProxyFromEnvironmentUnlessBlocked — only while local connections are
+// allowed (the default). A proxy resolves and dials the target itself, so the
+// post-resolution blocklist cannot see the real destination; with
+// --allow-local-connections=false the client therefore dials directly,
+// preserving the SSRF guarantee.
 func newSSRFSafeOIDCClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: utils.ConfigureHTTPTransport(&http.Transport{
+			Proxy:       utils.ProxyFromEnvironmentUnlessBlocked,
 			DialContext: utils.SafeNetDialer(timeout).DialContext,
 		}),
 	}

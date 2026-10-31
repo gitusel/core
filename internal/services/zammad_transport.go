@@ -46,7 +46,11 @@ func newZammadSafeTransport(baseURL, allowedPathPrefix string) zammad.Transport 
 		for key, value := range headers {
 			request.Header.Set(key, value)
 		}
-		transport := utils.ConfigureHTTPTransport(&http.Transport{DialContext: utils.SafeNetDialer(10 * time.Second).DialContext, DisableKeepAlives: true})
+		transport := utils.ConfigureHTTPTransport(&http.Transport{
+			Proxy:             utils.ProxyFromEnvironmentUnlessBlocked,
+			DialContext:       utils.SafeNetDialer(10 * time.Second).DialContext,
+			DisableKeepAlives: true,
+		})
 		client := &http.Client{Timeout: zammadHTTPTimeout, Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return errZammadRedirect }}
 		response, err := client.Do(request)
 		if err != nil {

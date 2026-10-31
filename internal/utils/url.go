@@ -181,12 +181,18 @@ func ValidateExternalURL(rawURL string) error {
 
 // NewSSRFSafeHTTPClient returns an *http.Client that blocks redirects and
 // validates resolved IPs against private ranges before connecting (DNS rebinding defense).
+// When HTTP(S)_PROXY is set and local connections are allowed, the dialer
+// validates the proxy's IP rather than the target's — the proxy resolves and
+// dials the target itself; the guarantee against private destinations is then
+// preserved by ProxyFromEnvironmentUnlessBlocked returning nil whenever
+// AllowLocalConnections is false.
 func NewSSRFSafeHTTPClient(timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{
 		Timeout: 5 * time.Second,
 	}
 
 	transport := ConfigureHTTPTransport(&http.Transport{
+		Proxy:       ProxyFromEnvironmentUnlessBlocked,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {

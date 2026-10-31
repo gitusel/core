@@ -42,6 +42,7 @@ func newSSRFSafeWebhookClient(timeout time.Duration) *http.Client {
 			return http.ErrUseLastResponse
 		},
 		Transport: utils.ConfigureHTTPTransport(&http.Transport{
+			Proxy:       utils.ProxyFromEnvironmentUnlessBlocked,
 			DialContext: utils.SafeNetDialer(timeout).DialContext,
 		}),
 	}

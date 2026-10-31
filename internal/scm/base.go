@@ -26,7 +26,10 @@ type baseProvider struct {
 func newSCMHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
-		Transport: utils.ConfigureHTTPTransport(&http.Transport{DialContext: utils.SafeNetDialer(timeout).DialContext}),
+		Transport: utils.ConfigureHTTPTransport(&http.Transport{
+			Proxy:       utils.ProxyFromEnvironmentUnlessBlocked,
+			DialContext: utils.SafeNetDialer(timeout).DialContext,
+		}),
 	}
 }
 
