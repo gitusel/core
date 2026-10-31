@@ -2962,18 +2962,6 @@ var Catalog = []Migration{
 		Postgres:      `ALTER TABLE intakes ADD COLUMN IF NOT EXISTS import_existing_mail BOOLEAN NOT NULL DEFAULT false`,
 	},
 	{
-		Version:       "20261031_sso_state_nonce",
-		Name:          "Store the OIDC nonce with SSO state tokens",
-		CheckSQLite:   sqliteColumnCheck("sso_state_tokens", "nonce"),
-		CheckPostgres: pgColumnCheck("sso_state_tokens", "nonce"),
-		SQLite: `
-			ALTER TABLE sso_state_tokens ADD COLUMN nonce TEXT;
-		`,
-		Postgres: `
-			ALTER TABLE sso_state_tokens ADD COLUMN IF NOT EXISTS nonce TEXT;
-		`,
-	},
-	{
 		Version:       "20261111_queues_collection_scope",
 		Name:          "Scope saved collection views by collection instead of workspace (WI-1870)",
 		CheckSQLite:   sqliteIndexCheck("idx_queues_collection_scope"),
