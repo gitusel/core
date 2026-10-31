@@ -44,6 +44,10 @@
     customFieldDefinitions = [],
     onitemUpdated = undefined,
     onupdateError = undefined,
+    // Rendered after the type icon, before the title text. The tree view uses
+    // it for the parent-reference chip so the chip cannot push a parent's
+    // title past its children's titles.
+    titleAfterIcon = null,
   } = $props();
 
   // Get the field definition for custom fields
@@ -146,6 +150,7 @@
           />
         {/if}
       {/if}
+      {#if titleAfterIcon}{@render titleAfterIcon({ item })}{/if}
       <div class="flex-1 min-w-0" data-testid={`workspace-item-title-${item.id}`}>
         {#if canEdit}
           <InlineFieldEditor
