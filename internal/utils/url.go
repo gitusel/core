@@ -192,7 +192,7 @@ func NewSSRFSafeHTTPClient(timeout time.Duration) *http.Client {
 	}
 
 	transport := ConfigureHTTPTransport(&http.Transport{
-		Proxy:       ProxyFromEnvironmentUnlessBlocked,
+		Proxy: ProxyFromEnvironmentUnlessBlocked,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {

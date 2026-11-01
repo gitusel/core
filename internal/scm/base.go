@@ -25,7 +25,7 @@ type baseProvider struct {
 // before the handshake. Redirect-following is preserved and re-checked per hop.
 func newSCMHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
-		Timeout:   timeout,
+		Timeout: timeout,
 		Transport: utils.ConfigureHTTPTransport(&http.Transport{
 			Proxy:       utils.ProxyFromEnvironmentUnlessBlocked,
 			DialContext: utils.SafeNetDialer(timeout).DialContext,

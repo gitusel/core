@@ -78,7 +78,7 @@ func NewCloudClient(config CloudConfig) (DefinitionClient, error) {
 
 	timeout := 30 * time.Second
 	httpClient := &http.Client{
-		Timeout:   timeout,
+		Timeout: timeout,
 		Transport: utils.ConfigureHTTPTransport(&http.Transport{
 			Proxy:       utils.ProxyFromEnvironmentUnlessBlocked,
 			DialContext: utils.SafeNetDialer(timeout).DialContext,

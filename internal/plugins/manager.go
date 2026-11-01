@@ -96,7 +96,7 @@ func NewManager(pluginDir string, opts ...Option) *Manager {
 		// re-checked on every redirect hop) so a plugin cannot reach
 		// 169.254.169.254 or internal services. Redirect-following is preserved.
 		HTTPClient: &http.Client{
-			Timeout:   10 * time.Second,
+			Timeout: 10 * time.Second,
 			Transport: utils.ConfigureHTTPTransport(&http.Transport{
 				Proxy:       utils.ProxyFromEnvironmentUnlessBlocked,
 				DialContext: utils.SafeNetDialer(10 * time.Second).DialContext,

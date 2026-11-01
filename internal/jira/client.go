@@ -152,7 +152,7 @@ func NewClient(cfg Config) (Client, error) {
 	// resolves to a private/internal host cannot receive the Jira
 	// credential. Redirect-following is preserved; each hop is re-checked.
 	httpClient := &http.Client{
-		Timeout:   timeout,
+		Timeout: timeout,
 		Transport: utils.ConfigureHTTPTransport(&http.Transport{
 			Proxy:       utils.ProxyFromEnvironmentUnlessBlocked,
 			DialContext: utils.SafeNetDialer(timeout).DialContext,
