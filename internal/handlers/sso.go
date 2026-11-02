@@ -399,7 +399,18 @@ func (h *SSOHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The ID token verified during the code exchange must carry the nonce that
-	// was sent when the login started.
+	// was sent when the login started. An empty stored nonce means the state
+	// row predates the nonce wiring (or was tampered with): since every login
+	// now persists a nonce and the TTL (15 min) outlives no release gap,
+	// failing closed is safe and avoids silently accepting a token that skips
+	// the nonce binding.
+	if stateToken.Nonce == "" {
+		slog.Warn("OIDC callback state token has no stored nonce",
+			slog.String("component", "sso"),
+			slog.String("provider", provider.Slug))
+		h.redirectWithError(w, r, "Login session expired. Please try signing in again.")
+		return
+	}
 	r = r.WithContext(sso.WithExpectedNonce(r.Context(), stateToken.Nonce))
 
 	// Decrypt client secret
