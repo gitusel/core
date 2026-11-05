@@ -1067,7 +1067,10 @@ func (s *Server) initialize() error {
 	assetActionHandler := handlers.NewAssetActionHandler(repository.NewAssetActionRepository(s.db), assetHandler, s.assetActionService, logger.NewAuditor(s.db))
 
 	jiraImportHandler := handlers.NewJiraImportHandler(s.db, cfg.Auth.SessionSecret, cfg.Jira.CapturePayloadsDir, attachmentStorage).
-		WithAuthorizationCacheInvalidator(authorizationCacheInvalidator)
+		WithAuthorizationCacheInvalidator(authorizationCacheInvalidator).
+		WithImportMaxDuration(cfg.Jira.ImportMaxDuration).
+		WithImportWatchers(cfg.Jira.ImportWatchers).
+		WithImportConcurrency(cfg.Jira.ImportConcurrency)
 	if n, err := jiraImportHandler.ReconcileInterruptedImports(); err != nil {
 		slog.Warn("failed to reconcile interrupted Jira imports", slog.Any("error", err))
 	} else if n > 0 {
@@ -2205,7 +2208,14 @@ func (s *Server) initialize() error {
 				slog.Warn("could not read index.html from embedded FS", "error", err)
 			}
 
-			contextPath := cfg.ContextPath
+			// The SPA shell carries the server's effective public base URL so admin
+			// screens can show the exact URLs the server will send to third parties
+			// instead of guessing from the browser origin.
+			indexBoot := indexBootstrap{
+				ContextPath:       cfg.ContextPath,
+				BaseURL:           baseURL,
+				BaseURLConfigured: cfg.BaseURL != "",
+			}
 			mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 				// Anything under an API root that hasn't matched a specific
 				// route is a 404 — don't fall through to the SPA shell.
@@ -2222,9 +2232,9 @@ func (s *Server) initialize() error {
 				}
 
 				// Inject CSP nonce into the inline theme script tag and expose the
-				// externally visible context path for the SPA translation layer.
+				// externally visible context path and base URL for the SPA.
 				nonce := CSPNonceFromContext(r.Context())
-				html := prepareIndexHTML(indexHTML, nonce, contextPath)
+				html := prepareIndexHTML(indexHTML, nonce, indexBoot)
 
 				w.Header().Set("Content-Type", "text/html")
 				// Force the SPA shell to revalidate on every load so that a
