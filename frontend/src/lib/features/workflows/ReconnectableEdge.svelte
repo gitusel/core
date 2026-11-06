@@ -64,9 +64,21 @@
   />
 {/if}
 
-<!-- A bound transition screen is visible at a glance, not only on selection. -->
+<!-- Invisible wider stroke: the edge is easier to click, and it gives the
+     designer a stable target for the transition id. -->
+<path
+  d={edgePath}
+  fill="none"
+  stroke="transparent"
+  stroke-width="14"
+  style="pointer-events: stroke;"
+  data-testid={data?.transitionId ? `workflow-edge-${data.transitionId}` : undefined}
+/>
+
+<!-- A bound transition screen is visible at a glance, not only on selection.
+     It sits below the midpoint so it never overlaps the swap control. -->
 {#if data?.screen}
-  <foreignObject x={labelX - 12} y={labelY + 8} width="24" height="20" style="overflow: visible;">
+  <foreignObject x={labelX - 12} y={labelY + 18} width="24" height="20" style="overflow: visible;">
     <div
       class="edge-screen-badge"
       title={data.screen.name}

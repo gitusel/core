@@ -34,6 +34,7 @@ import (
 	"windshift/internal/events"
 	"windshift/internal/handlers"
 	"windshift/internal/health"
+	"windshift/internal/integrations/docmost"
 	"windshift/internal/itemevents"
 	"windshift/internal/ldap"
 	"windshift/internal/licensing"
@@ -788,7 +789,15 @@ func (s *Server) initialize() error {
 		pagePermissionService,
 		permService,
 	)
+	docmostClient := docmost.NewClient()
+	docmostService := services.NewDocmostService(
+		repository.NewIntegrationProviderRepository(s.db),
+		repository.NewIntegrationTokenRepository(s.db),
+		services.NewDocmostCredentialEncryption(cfg.Auth.SessionSecret),
+		docmostClient,
+	)
 	knowledgeRetrieval := services.NewKnowledgeRetrievalService(s.db, pagePermissionService)
+	knowledgeRetrieval.SetDocmost(docmostService, docmostClient)
 	knowledgeSearchHandler := handlers.NewKnowledgeSearchHandler(knowledgeRetrieval)
 	knowledgePublication := services.NewKnowledgePublicationService(s.db)
 	pageLabelService := services.NewPageLabelService(pageLabelRepo, logger.NewAuditor(s.db))
@@ -1113,7 +1122,7 @@ func (s *Server) initialize() error {
 	s.kbEventsRetention.Start()
 
 	integrationProviderHandler := handlers.NewIntegrationProviderHandler(repository.NewIntegrationProviderRepository(s.db), scmProviderHandler.GetEncryption(), logger.NewAuditor(s.db))
-	integrationOAuthHandler := handlers.NewIntegrationOAuthHandler(s.db, scmProviderHandler.GetEncryption(), baseURL)
+	integrationOAuthHandler := handlers.NewIntegrationOAuthHandler(s.db, scmProviderHandler.GetEncryption(), baseURL, docmostService)
 	integrationItemLinksHandler := handlers.NewIntegrationItemLinksHandler(s.db, scmProviderHandler.GetEncryption(), permService)
 	todoistSyncHandler := handlers.NewTodoistSyncHandler(s.db, scmProviderHandler.GetEncryption())
 	s.todoistSyncScheduler = scheduler.NewTodoistSyncScheduler(s.db, scmProviderHandler.GetEncryption())
