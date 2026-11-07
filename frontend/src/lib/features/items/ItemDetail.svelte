@@ -1496,6 +1496,7 @@ import NativeSelect from '../../components/NativeSelect.svelte';
     onattachmentUpload={attachmentManager.handleUpload}
     onattachmentUploadFiles={attachmentManager.uploadFiles}
     onattachmentDelete={attachmentManager.handleDelete}
+    onattachmentToggleVisibility={attachmentManager.handleToggleVisibility}
     onattachmentPageChange={attachmentManager.handlePageChange}
     onattachmentPageSizeChange={attachmentManager.handlePageSizeChange}
     ondiagramSaved={handleDiagramSaved}
@@ -1793,6 +1794,7 @@ import NativeSelect from '../../components/NativeSelect.svelte';
     workspaceId={itemDetailStore.item?.workspace_id}
     milestones={itemDetailStore.milestones}
     iterations={itemDetailStore.iterations}
+    itemLabels={itemDetailStore.item?.labels || []}
     onconfirm={handleTransitionConfirm}
     oncancel={() => (transitionScreen = null)}
   />
