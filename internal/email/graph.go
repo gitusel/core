@@ -25,9 +25,12 @@ type GraphClient struct {
 }
 
 // Defaults per Microsoft identity platform: tokens come from
-// login.microsoftonline.com while the API lives on graph.microsoft.com.
+// login.microsoftonline.com while the API lives on graph.microsoft.com. The
+// API root must carry the version segment: sendMail resolves
+// https://graph.microsoft.com/v1.0/users/{upn}/sendMail — a bare
+// graph.microsoft.com/users/... yields 404 Invalid version.
 const (
-	defaultGraphAPIBase   = "https://graph.microsoft.com"
+	defaultGraphAPIBase   = "https://graph.microsoft.com/v1.0"
 	defaultGraphTokenBase = "https://login.microsoftonline.com"
 )
 
