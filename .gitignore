@@ -34,6 +34,7 @@ cx
 !/internal/services/channel_secret_fields_test.go
 !/internal/smtp/graph_dispatch_test.go
 !/internal/server/graph_sender_adapter_test.go
+!/internal/handlers/graph_test_paths_test.go
 *_test.sh
 *.test.js
 *.test.ts
