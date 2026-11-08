@@ -531,6 +531,12 @@ func (s *Server) initialize() error {
 	}
 
 	smtpSender := smtp.NewNotificationSMTPSender(s.db)
+	// Wire the Graph send transport: email.GraphClient satisfies
+	// smtp.GraphSender via the adapter (token shape differs: email.OAuthTokens
+	// carries *time.Time, smtp.GraphToken carries time.Time).
+	smtpSender.SetGraphSender(graphSenderFromEmailClient(
+		email.NewGraphClient("", "", nil),
+	))
 	s.notificationScheduler = scheduler.NewNotificationScheduler(s.db, smtpSender, cfg.Notification.BatchInterval, s.notificationService)
 	if cfg.Notification.OutboxBatchSize > 0 {
 		s.notificationScheduler.SetOutboxBatchSize(cfg.Notification.OutboxBatchSize)
