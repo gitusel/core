@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -191,5 +193,27 @@ func TestGraphClientUsesSSRFSafeTransportByDefault(t *testing.T) {
 	// independent hosts per Microsoft identity platform.
 	if client.TokenURL("tenant-x") != "https://login.microsoftonline.com/tenant-x/oauth2/v2.0/token" {
 		t.Errorf("default token URL = %s", client.TokenURL("tenant-x"))
+	}
+}
+
+// TestDefaultAPIBaseCarriesVersion pins the Graph API root contract: the
+// default apiBase must include the version segment, so SendMime resolves
+// https://graph.microsoft.com/v1.0/users/{upn}/sendMail. A bare
+// graph.microsoft.com/users/... route returns 404 "Invalid version: users"
+// from Microsoft's edge, which only repro'd live — every other test injects
+// its own base URL, so this regression could recurred silently.
+func TestDefaultAPIBaseCarriesVersion(t *testing.T) {
+	if defaultGraphAPIBase != "https://graph.microsoft.com/v1.0" {
+		t.Fatalf("defaultGraphAPIBase = %q, want https://graph.microsoft.com/v1.0", defaultGraphAPIBase)
+	}
+	// The endpoint shape a default-configured client produces.
+	client := NewGraphClient("", "https://login.microsoftonline.com", nil)
+	reconstructed := fmt.Sprintf("%s/users/%s/sendMail", client.apiBase, "windshift@contoso.com")
+	u, err := url.Parse(reconstructed)
+	if err != nil {
+		t.Fatalf("parse %q: %v", reconstructed, err)
+	}
+	if u.Path != "/v1.0/users/windshift@contoso.com/sendMail" {
+		t.Fatalf("default endpoint resolves %q, want /v1.0/users/.../sendMail", u.Path)
 	}
 }
