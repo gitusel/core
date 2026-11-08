@@ -1694,6 +1694,8 @@ func ScrubChannelConfig(configJSON string) string {
 	delete(config, "email_oauth_client_secret")
 	delete(config, "email_oauth_access_token")
 	delete(config, "email_oauth_refresh_token")
+	delete(config, "graph_client_secret")
+	delete(config, "graph_access_token")
 
 	// Re-marshal
 	scrubbed, err := json.Marshal(config)

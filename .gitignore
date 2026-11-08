@@ -28,6 +28,8 @@ cx
 !/internal/utils/proxy_test.go
 !/internal/sso/oidc_nonce_test.go
 !/internal/database/sso_nonce_persistence_test.go
+!/internal/models/channel_graph_test.go
+!/internal/email/graph_test.go
 *_test.sh
 *.test.js
 *.test.ts

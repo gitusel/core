@@ -70,7 +70,7 @@ var channelSlugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`)
 // A partial update treats an omitted or blank value as "keep the stored
 // ciphertext" so a form that echoes back an unedited secret cannot delete it.
 // JSON null is the explicit way to clear one.
-var channelSecretFields = []string{"smtp_password", "imap_password", "webhook_secret", "email_oauth_client_secret"}
+var channelSecretFields = []string{"smtp_password", "imap_password", "webhook_secret", "email_oauth_client_secret", "graph_client_secret", "graph_access_token"}
 
 func isChannelSecretField(key string) bool {
 	return slices.Contains(channelSecretFields, key)

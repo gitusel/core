@@ -2,6 +2,7 @@ package models
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -102,6 +103,18 @@ type ChannelConfig struct {
 	SMTPEncryption    string `json:"smtp_encryption,omitempty"` // tls/starttls, ssl, none
 	SMTPSkipTLSVerify bool   `json:"smtp_skip_tls_verify,omitempty"`
 	SMTPAuthMethod    string `json:"smtp_auth_method,omitempty"` // auto (default), plain, login, cram-md5, none
+
+	// Graph (Microsoft 365) send configuration. SendProvider selects between
+	// the legacy SMTP route and the Graph sendMail route; when "graph", the
+	// Graph* fields configure a client-credentials application token that
+	// sends as the service mailbox (upn).
+	GraphSendProvider   string     `json:"graph_send_provider,omitempty"`    // "smtp" (default/empty) or "graph"
+	GraphTenantID       string     `json:"graph_tenant_id,omitempty"`        // Azure AD tenant GUID (or domain)
+	GraphClientID       string     `json:"graph_client_id,omitempty"`        // App registration client ID
+	GraphClientSecret   string     `json:"graph_client_secret,omitempty"`    // Encrypted app registration secret
+	GraphMailboxUPN     string     `json:"graph_mailbox_upn,omitempty"`      // Service mailbox the app sends as
+	GraphAccessToken    string     `json:"graph_access_token,omitempty"`     // Encrypted, cached token
+	GraphTokenExpiresAt *time.Time `json:"graph_token_expires_at,omitempty"` // Cached token expiry
 
 	// Webhook Configuration
 	WebhookURL              string            `json:"webhook_url,omitempty"`
@@ -208,6 +221,38 @@ type ChannelConfig struct {
 	FormWorkspaceIDs   []int  `json:"form_workspace_ids"`             // Target workspaces for submissions
 	FormSuccessMessage string `json:"form_success_message,omitempty"` // Default post-submit message
 	FormRedirectURL    string `json:"form_redirect_url,omitempty"`    // Optional redirect after submit
+}
+
+// SendProvider reports which outbound transport this channel uses. Empty or
+// unknown values fall back to "smtp" so existing channels keep their behavior
+// when the config predates the Graph option.
+func (c ChannelConfig) SendProvider() string {
+	if c.GraphSendProvider == "graph" {
+		return "graph"
+	}
+	return "smtp"
+}
+
+// Validate checks the send configuration. Graph mode requires the full
+// client-credentials set; SMTP mode keeps its own field checks in the SMTP
+// dispatch path.
+func (c ChannelConfig) Validate() error {
+	if c.SendProvider() != "graph" {
+		return nil
+	}
+	if c.GraphTenantID == "" {
+		return fmt.Errorf("graph send requires a tenant id")
+	}
+	if c.GraphClientID == "" {
+		return fmt.Errorf("graph send requires a client id")
+	}
+	if c.GraphClientSecret == "" {
+		return fmt.Errorf("graph send requires a client secret")
+	}
+	if c.GraphMailboxUPN == "" {
+		return fmt.Errorf("graph send requires a mailbox upn to send as")
+	}
+	return nil
 }
 
 // Email post-processing dispositions. Exactly one applies to successfully
