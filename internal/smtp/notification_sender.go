@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -1061,23 +1062,41 @@ func (s *NotificationSMTPSender) dispatchGraph(ctx context.Context, config *mode
 	return nil
 }
 
+// fingerprintSecret derives a SHA-256 fingerprint of the decrypted client
+// secret for cache-keying, so the raw secret is not retained in memory
+// alongside the token.
+func fingerprintSecret(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
 // graphTokenFor returns a cached client-credentials token, refreshing it
 // ahead of expiry (60s safety margin) or when the credentials change. The
 // mutex serializes fetches so concurrent sends share one token request.
+// Tokens whose mapped expiry is zero (unknown lifetime) are never cached:
+// every send refetches.
 func (s *NotificationSMTPSender) graphTokenFor(ctx context.Context, tenantID, clientID, clientSecret string) (*GraphToken, error) {
 	s.graphTokenMu.Lock()
 	defer s.graphTokenMu.Unlock()
 
-	cred := tenantID + "|" + clientID + "|" + clientSecret
+	cred := tenantID + "|" + clientID + "|" + fingerprintSecret(clientSecret)
 	if s.graphToken != nil && s.graphTokenCred == cred && time.Until(s.graphToken.ExpiresAt) > time.Minute {
 		return s.graphToken, nil
 	}
 	token, err := s.graph.FetchToken(ctx, tenantID, clientID, clientSecret)
 	if err != nil {
+		// A failed refresh invalidates the cached token so a broken credential
+		// doesn't keep serving a possibly-revoked token.
+		s.graphToken = nil
+		s.graphTokenCred = ""
 		return nil, err
 	}
 	if token == nil || token.AccessToken == "" {
 		return nil, fmt.Errorf("graph token fetch returned no token")
+	}
+	if token.ExpiresAt.IsZero() {
+		// Unknown lifetime: hand the token out but do not cache it.
+		return token, nil
 	}
 	s.graphToken = token
 	s.graphTokenCred = cred

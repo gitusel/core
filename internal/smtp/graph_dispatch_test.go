@@ -29,6 +29,7 @@ type fakeGraphSender struct {
 	fetchErr   error
 	sendErr    error
 	wantSecret string // non-empty: fetch fails with AADSTS7000215 unless clientSecret matches
+	failNext   bool   // one-shot: next FetchToken fails regardless of fixture state
 
 	fetchCount int
 	sendCalls  []CapturedSend
@@ -44,6 +45,10 @@ func (f *fakeGraphSender) FetchToken(ctx context.Context, tenantID, clientID, cl
 	defer f.mu.Unlock()
 	f.fetchCount++
 	f.gotSecret = clientSecret
+	if f.failNext {
+		f.failNext = false
+		return nil, errors.New("invalid_client: AADSTS7000215")
+	}
 	if f.fetchErr != nil {
 		return nil, f.fetchErr
 	}
@@ -225,3 +230,117 @@ func TestDispatchContextSMTPUnchanged(t *testing.T) {
 		t.Errorf("token fetched for an SMTP channel")
 	}
 }
+
+// TestGraphTokenCacheRotation pins credential rotation: after a successful
+// send with secret A, switching the channel's secret to a different
+// ciphertext (decrypting differently) must refetch, not reuse the old
+// token. Driven by two fakes whose wantSecret differ.
+func TestGraphTokenCacheRotation(t *testing.T) {
+	fg := &fakeGraphSender{} // wantSecret empty: accepts any plaintext, records it
+	sender := NewNotificationSMTPSender(nil)
+	sender.SetGraphSender(fg)
+
+	enc := &rotatingEncryptor{}
+	sender.SetEncryption(enc)
+	if err := sender.dispatchContext(context.Background(), graphChannel(), "d@x.com", []byte("mime")); err != nil {
+		t.Fatalf("first send: %v", err)
+	}
+	if fg.fetchCount != 1 || len(fg.sendCalls) != 1 {
+		t.Fatalf("first send state: fetch=%d send=%d", fg.fetchCount, len(fg.sendCalls))
+	}
+	firstSecret := fg.gotSecret
+
+	// The encryption now yields a different plaintext, so the fingerprint
+	// changes and the cache must refresh with the new credential.
+	enc.rotate()
+	if err := sender.dispatchContext(context.Background(), graphChannel(), "d@x.com", []byte("mime")); err != nil {
+		t.Fatalf("second send: %v", err)
+	}
+	if fg.fetchCount != 2 {
+		t.Errorf("rotation did not refetch: fetch=%d", fg.fetchCount)
+	}
+	if fg.gotSecret == firstSecret {
+		t.Errorf("second fetch reused old secret %q", firstSecret)
+	}
+	if fg.gotSecret != "rotated-secret" {
+		t.Errorf("second fetch secret = %q, want rotated-secret", fg.gotSecret)
+	}
+}
+
+// rotatingEncryptor decrypts to "plain-secret" until rotate() is called,
+// then yields "rotated-secret", simulating a credential change through the
+// same decryption helper.
+type rotatingEncryptor struct{ rotated bool }
+
+func (r *rotatingEncryptor) rotate() { r.rotated = true }
+func (r *rotatingEncryptor) Decrypt(string) (string, error) {
+	if r.rotated {
+		return "rotated-secret", nil
+	}
+	return "plain-secret", nil
+}
+func (r *rotatingEncryptor) Encrypt(string) (string, error) { return "enc:v1:x", nil }
+
+var _ Encryptor = (*rotatingEncryptor)(nil)
+
+// TestGraphTokenZeroExpiryNeverCached pins the fail-safe cache rule: a
+// token mapping to zero expiry is handed out but never cached, so every
+// send refetches until a properly-expiring token arrives.
+func TestGraphTokenZeroExpiryNeverCached(t *testing.T) {
+	sender := NewNotificationSMTPSender(nil)
+	z := &zeroExpiryGraphSender{}
+	sender.SetGraphSender(z)
+
+	t1, err := sender.graphTokenFor(context.Background(), "t", "c", "s")
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	t2, err := sender.graphTokenFor(context.Background(), "t", "c", "s")
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if !t1.ExpiresAt.IsZero() || !t2.ExpiresAt.IsZero() {
+		t.Fatal("test fixture broken: want zero-expiry tokens")
+	}
+	if sender.graphToken != nil {
+		t.Errorf("zero-expiry token was cached")
+	}
+	if z.n != 2 {
+		t.Errorf("fetch count = %d across two sends with zero-expiry tokens, want 2 (refetch every send)", z.n)
+	}
+}
+
+// TestGraphTokenFailedRefreshInvalidates pins the fail-closed refresh rule:
+// once the cached token is past the 60s refresh margin, a failed fetch must
+// evict it so a revoked credential cannot keep serving stale tokens.
+func TestGraphTokenFailedRefreshInvalidates(t *testing.T) {
+	sender := NewNotificationSMTPSender(nil)
+	sender.SetEncryption(fakeEncryptor{})
+	fg := &fakeGraphSender{}
+	sender.SetGraphSender(fg)
+
+	// Prime the cache with a token near expiry so the next call takes the
+	// refresh path instead of serving the cache.
+	sender.graphToken = &GraphToken{
+		AccessToken: "stale-token",
+		ExpiresAt:   time.Now().Add(30 * time.Second), // inside the 60s refresh margin
+	}
+	sender.graphTokenCred = "t|c|" + fingerprintSecret("plain-secret")
+
+	fg.failNext = true
+	if _, err := sender.graphTokenFor(context.Background(), "t", "c", "plain-secret"); err == nil {
+		t.Fatal("expected refresh failure")
+	}
+	if sender.graphToken != nil {
+		t.Errorf("failed refresh left the token cached")
+	}
+}
+
+// zeroExpiryGraphSender always hands out zero-expiry tokens.
+type zeroExpiryGraphSender struct{ n int }
+
+func (z *zeroExpiryGraphSender) FetchToken(context.Context, string, string, string) (*GraphToken, error) {
+	z.n++
+	return &GraphToken{AccessToken: "tok"}, nil
+}
+func (z *zeroExpiryGraphSender) SendMime(context.Context, string, string, []byte) error { return nil }

@@ -738,6 +738,17 @@ func (h *ChannelHandler) TestChannel(w http.ResponseWriter, r *http.Request) {
 
 	switch channel.Type {
 	case "smtp":
+		var cfg models.ChannelConfig
+		_ = json.Unmarshal([]byte(channel.Config), &cfg)
+		if cfg.SendProvider() == "graph" {
+			success, message := h.testGraphChannelWithClient(channel, testRequest.TestEmail)
+			result["success"] = success
+			result["message"] = message
+			if success {
+				h.updateChannelActivity(ctx, channel.ID)
+			}
+			break
+		}
 		success, message := h.testSMTPChannelWithEmail(channel, testRequest.TestEmail)
 		result["success"] = success
 		result["message"] = message
@@ -762,7 +773,8 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 	var err error
 
 	var testData struct {
-		Config models.ChannelConfig `json:"config"`
+		Config    models.ChannelConfig `json:"config"`
+		TestEmail string               `json:"test_email"`
 	}
 	if !decodeChannelRequest(w, r, &testData, false) {
 		return
@@ -825,6 +837,49 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 
 	switch channelType {
 	case "smtp":
+		// Graph channels skip the SMTP connection probe: their send path needs
+		// no SMTP host/port, and the shared test-email path (below) exercises
+		// the real Graph dispatch. Restore the stored secret first so an
+		// unsaved-edit test that omits it still uses the stored ciphertext.
+		if testData.Config.SendProvider() == "graph" && testData.Config.GraphClientSecret == "" {
+			rawConfig, configErr := h.service.GetConfig(ctx, id)
+			if configErr != nil {
+				respondInternalError(w, r, configErr)
+				return
+			}
+			var stored models.ChannelConfig
+			if configErr = json.Unmarshal([]byte(rawConfig), &stored); configErr != nil {
+				respondInternalError(w, r, configErr)
+				return
+			}
+			testData.Config.GraphClientSecret = stored.GraphClientSecret
+		}
+		if testData.Config.SendProvider() == "graph" {
+			// A live test sends a real email: require an explicit, valid
+			// recipient rather than a hardcoded address.
+			testEmail, valid := bareEmailAddress(testData.TestEmail)
+			if !valid {
+				respondValidationError(w, r, "test_email is required for a Graph send test")
+				return
+			}
+			if h.smtpSender == nil {
+				respondInternalError(w, r, fmt.Errorf("email sender not configured"))
+				return
+			}
+			graphConfig := testData.Config
+			if err := graphConfig.Validate(); err != nil {
+				respondValidationError(w, r, err.Error())
+				return
+			}
+			if err := h.smtpSender.SendEmailWithConfig(&graphConfig, testEmail, "Windshift Graph Test Email", "<p>test</p>", "test"); err != nil {
+				result["success"] = false
+				result["message"] = "Graph send test: " + err.Error()
+			} else {
+				result["success"] = true
+				result["message"] = "Graph send successful"
+			}
+			break
+		}
 		result["success"] = h.testSMTPConfig(testData.Config)
 		if ok := result["success"].(bool); ok { //nolint:errcheck // type assertion always succeeds for bool
 			result["message"] = "SMTP connection successful"
@@ -846,6 +901,32 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 	}
 
 	respondJSONOK(w, result)
+}
+
+// testGraphChannelWithClient tests a Graph send channel by sending a test
+// email through the shared sender — dispatchContext routes Graph configs to
+// the GraphSender, and the raw config carries the encrypted secret exactly as
+// the sender expects to decrypt it. All Graph fields (tenant, client id,
+// secret, mailbox UPN) must already be stored; Graph configs carry no SMTP
+// host, so the SMTP field checks do not apply.
+func (h *ChannelHandler) testGraphChannelWithClient(channel models.Channel, testEmail string) (success bool, message string) {
+	var config models.ChannelConfig
+	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
+		return false, "Failed to parse channel configuration: " + err.Error()
+	}
+	if err := config.Validate(); err != nil {
+		return false, err.Error()
+	}
+	if h.smtpSender == nil {
+		return false, "Email sender not configured"
+	}
+
+	subject := "Windshift Graph Test Email"
+	htmlBody, textBody := buildSMTPTestEmailBodies(channel.Name, time.Now())
+	if err := h.smtpSender.SendEmailWithConfig(&config, testEmail, subject, htmlBody, textBody); err != nil {
+		return false, "Failed to send test email: " + err.Error()
+	}
+	return true, "Test email sent via Microsoft Graph to " + testEmail
 }
 
 // testSMTPChannelWithEmail tests an SMTP channel by sending a test email
