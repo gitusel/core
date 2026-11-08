@@ -210,6 +210,16 @@ type NotificationSMTPSender struct {
 	encryption Encryptor
 	baseURL    string
 
+	// graph, when set, receives channels whose config selects
+	// graph_send_provider=graph. nil keeps every channel on SMTP.
+	graph GraphSender
+
+	// graphTokenMu guards graphToken*: one in-flight token fetch per sender,
+	// shared across channels and goroutines.
+	graphTokenMu   sync.Mutex
+	graphToken     *GraphToken
+	graphTokenCred string // tenant|clientID|secret fingerprint of the cached token
+
 	breakerMu        sync.Mutex
 	breakerFailures  int
 	breakerOpenUntil time.Time
@@ -220,6 +230,27 @@ type NotificationSMTPSender struct {
 	// long digest delivery.
 	sessionMu sync.Mutex
 	sessions  []*smtpSession
+}
+
+// GraphToken is a cached application access token for Microsoft Graph.
+type GraphToken struct {
+	AccessToken string
+	ExpiresAt   time.Time
+}
+
+// GraphSender is the transport behind the Graph send branch: mint an
+// application token for the tenant and post a fully built MIME message as
+// the service mailbox. email.GraphClient implements it; the production
+// wiring adapts it in server.go.
+type GraphSender interface {
+	FetchToken(ctx context.Context, tenantID, clientID, clientSecret string) (*GraphToken, error)
+	SendMime(ctx context.Context, accessToken, mailboxUPN string, mime []byte) error
+}
+
+// SetGraphSender wires the Graph send transport. nil (default) keeps every
+// channel on the SMTP path.
+func (s *NotificationSMTPSender) SetGraphSender(g GraphSender) {
+	s.graph = g
 }
 
 const (
@@ -722,6 +753,12 @@ func (s *NotificationSMTPSender) dispatchContext(ctx context.Context, config *mo
 	if config == nil {
 		return fmt.Errorf("SMTP config is required")
 	}
+	// Graph channels route through the Graph sender before any SMTP field
+	// validation: a Graph config carries no SMTP host/port, so the legacy
+	// checks below would reject it.
+	if config.SendProvider() == "graph" {
+		return s.dispatchGraph(ctx, config, message)
+	}
 	fromEmail, err := normalizeEnvelopeAddress(config.SMTPFromEmail)
 	if err != nil {
 		return fmt.Errorf("invalid SMTP from address: %w", err)
@@ -987,6 +1024,64 @@ func (s *NotificationSMTPSender) sendEmailContext(ctx context.Context, config *m
 		return err
 	}
 	return s.dispatchContext(ctx, config, toEmail, message)
+}
+
+// dispatchGraph sends a pre-built MIME message through Microsoft Graph,
+// skipping every SMTP-specific field check. Fail-closed: a Graph channel
+// without the full client-credentials set, without a wired sender, or with
+// an empty decrypted secret refuses to send.
+func (s *NotificationSMTPSender) dispatchGraph(ctx context.Context, config *models.ChannelConfig, message []byte) error {
+	if s.graph == nil {
+		return fmt.Errorf("graph send is not enabled: no graph sender wired")
+	}
+	if config.GraphTenantID == "" {
+		return fmt.Errorf("graph tenant id is not configured")
+	}
+	if config.GraphClientID == "" {
+		return fmt.Errorf("graph client id is not configured")
+	}
+	clientSecret, err := decryptOrLegacy(s.encryption, config.GraphClientSecret)
+	if err != nil {
+		return err
+	}
+	if clientSecret == "" {
+		return fmt.Errorf("graph client secret is not configured")
+	}
+	if config.GraphMailboxUPN == "" {
+		return fmt.Errorf("graph mailbox upn is not configured")
+	}
+
+	token, err := s.graphTokenFor(ctx, config.GraphTenantID, config.GraphClientID, clientSecret)
+	if err != nil {
+		return fmt.Errorf("graph token fetch failed: %w", err)
+	}
+	if err := s.graph.SendMime(ctx, token.AccessToken, config.GraphMailboxUPN, message); err != nil {
+		return fmt.Errorf("graph send failed: %w", err)
+	}
+	return nil
+}
+
+// graphTokenFor returns a cached client-credentials token, refreshing it
+// ahead of expiry (60s safety margin) or when the credentials change. The
+// mutex serializes fetches so concurrent sends share one token request.
+func (s *NotificationSMTPSender) graphTokenFor(ctx context.Context, tenantID, clientID, clientSecret string) (*GraphToken, error) {
+	s.graphTokenMu.Lock()
+	defer s.graphTokenMu.Unlock()
+
+	cred := tenantID + "|" + clientID + "|" + clientSecret
+	if s.graphToken != nil && s.graphTokenCred == cred && time.Until(s.graphToken.ExpiresAt) > time.Minute {
+		return s.graphToken, nil
+	}
+	token, err := s.graph.FetchToken(ctx, tenantID, clientID, clientSecret)
+	if err != nil {
+		return nil, err
+	}
+	if token == nil || token.AccessToken == "" {
+		return nil, fmt.Errorf("graph token fetch returned no token")
+	}
+	s.graphToken = token
+	s.graphTokenCred = cred
+	return token, nil
 }
 
 func smtpTLSConfig(addr string, skipTLSVerify bool) *tls.Config {
