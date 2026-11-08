@@ -30,6 +30,8 @@ cx
 !/internal/database/sso_nonce_persistence_test.go
 !/internal/models/channel_graph_test.go
 !/internal/email/graph_test.go
+!/internal/repository/scrub_graph_secrets_test.go
+!/internal/services/channel_secret_fields_test.go
 *_test.sh
 *.test.js
 *.test.ts

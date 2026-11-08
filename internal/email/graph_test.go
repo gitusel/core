@@ -193,6 +193,3 @@ func TestGraphClientUsesSSRFSafeTransportByDefault(t *testing.T) {
 		t.Errorf("default token URL = %s", client.TokenURL("tenant-x"))
 	}
 }
-
-// compile-time interface checks for the token cache seam used in Phase 3.
-var _ = http.MethodPost
