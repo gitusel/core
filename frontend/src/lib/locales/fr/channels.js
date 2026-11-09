@@ -326,6 +326,7 @@ export default {
     sendTestEmail: 'Envoyer un e-mail de test',
     sendingTestEmail: 'Envoi de l’e-mail de test…',
     testEmailSent: 'E-mail de test envoyé avec succès ! La configuration a été enregistrée.',
+    testEmailSentViaGraph: "E-mail de test envoyé via Microsoft Graph ! La configuration a été enregistrée.",
     testEmailFailed: 'Échec de l’envoi de l’e-mail de test',
 
     // Processing Log

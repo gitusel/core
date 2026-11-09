@@ -286,6 +286,7 @@ export default {
     sendingTestEmail: '发送测试邮件中...',
     testEmailSent: '测试邮件发送成功！配置已保存。',
     testEmailFailed: '测试邮件失败',
+    testEmailSentViaGraph: "测试邮件已通过 Microsoft Graph 发送！配置已保存。",
     processingLog: '处理日志',
     emailLog: {
       syncStatus: '同步状态',

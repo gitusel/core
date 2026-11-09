@@ -288,6 +288,7 @@ export default {
     sendTestEmail: 'Test-E-Mail senden',
     sendingTestEmail: 'Test-E-Mail wird gesendet...',
     testEmailSent: 'Test-E-Mail erfolgreich gesendet! Konfiguration wurde gespeichert.',
+    testEmailSentViaGraph: "Test-E-Mail über Microsoft Graph gesendet! Konfiguration wurde gespeichert.",
     testEmailFailed: 'Test-E-Mail fehlgeschlagen',
     processingLog: 'Verarbeitungsprotokoll',
     emailLog: {

@@ -38,6 +38,14 @@
 
   async function testSmtpSettings() {
     if (!$isSystemAdmin || loading) return;
+    // Provider-specific required fields first: Graph mode must not save a
+    // tenant/client/UPN-less config just because the legacy host gate lets it
+    // through, and SMTP mode keeps its own checks.
+    const validation = validate();
+    if (!validation.valid) {
+      testResult = { success: false, message: validation.message };
+      return;
+    }
     // Graph mode never dials the SMTP host, but the backend's readiness gate
     // still needs host/port/from placeholders — treat them as satisfied and
     // prefill host on demand so the test button is usable from a bare Graph
@@ -68,7 +76,9 @@
       if (result.success) {
         testResult = {
           success: true,
-          message: t('channel.testEmailSent'),
+          message: formData.send_provider === 'graph'
+            ? t('channel.testEmailSentViaGraph')
+            : t('channel.testEmailSent'),
           loading: false
         };
         onSave();

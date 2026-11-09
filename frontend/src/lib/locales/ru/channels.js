@@ -373,6 +373,7 @@ export default {
     sendingTestEmail: 'Отправка тестового письма…',
     testEmailSent: 'Тестовое письмо отправлено, настройки сохранены.',
     testEmailFailed: 'Не удалось отправить тестовое письмо',
+    testEmailSentViaGraph: "Тестовое письмо отправлено через Microsoft Graph! Конфигурация сохранена.",
     customerReplies: 'Ответы клиентам',
     processingLog: 'Журнал обработки',
     emailLog: {
