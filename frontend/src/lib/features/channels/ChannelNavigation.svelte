@@ -15,13 +15,26 @@
   let activeTypeFilter = $derived($currentRoute.params?.type || null);
   let isAllCategoriesActive = $derived(activeCategoryId === null && activeTypeFilter === null);
 
-  // Channel type definitions (use $derived for reactive translations)
+  // Channel type definitions (use $derived for reactive translations). The
+  // smtp type is replaced by two transport entries: SMTP (non-Graph smtp
+  // channels) and Graph (smtp channels whose config routes through Microsoft
+  // Graph), so the sidebar filters match the transport users think in.
   let channelTypes = $derived([
     { ...allTypesEntry, label: t('channels.allTypes') },
-    ...channelTypeDefs.filter(ct => ct.id !== 'smtp').map(ct => ({
+    ...channelTypeDefs.filter(ct => ct.id !== 'smtp' && ct.id !== 'graph').map(ct => ({
       ...ct, label: t(`channels.${ct.id}`)
-    }))
-  ]);
+    })),
+    {
+      id: 'smtp',
+      navColor: 'from-ds-nav-orange-from to-ds-nav-orange-to',
+      label: t('channels.smtp')
+    },
+    {
+      id: 'graph',
+      navColor: 'from-ds-nav-orange-from to-ds-nav-orange-to',
+      label: t('channels.graph')
+    }
+  ].map(o => ({ icon: allTypesEntry.icon, ...o })));
 
   onMount(async () => {
     // Load categories when component mounts

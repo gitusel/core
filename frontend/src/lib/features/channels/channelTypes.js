@@ -37,6 +37,16 @@ export const channelTypes = [
     navColor: 'from-ds-nav-orange-from to-ds-nav-orange-to',
     formColor: 'var(--ds-icon-accent-orange)',
   },
+  // Virtual type: smtp/outbound channels whose config selects Graph send.
+  // Backend only knows type smtp; this entry powers the nav filter, type
+  // column and create picker, with handleChannelSubmit + the config form
+  // normalizing to graph_send_provider on the smtp channel.
+  {
+    id: 'graph',
+    icon: IconSend,
+    navColor: 'from-ds-nav-orange-from to-ds-nav-orange-to',
+    formColor: 'var(--ds-icon-accent-orange)',
+  },
 ];
 
 export const allTypesEntry = {
@@ -47,4 +57,28 @@ export const allTypesEntry = {
 
 export function getChannelTypeIcon(type) {
   return channelTypes.find((ct) => ct.id === type)?.icon ?? IconLifebuoy;
+}
+
+// getChannelConfig normalizes a channel's config to an object: the API
+// returns a JSON string, the form state an object.
+export function getChannelConfig(channel) {
+  if (!channel?.config) return {};
+  if (typeof channel.config === 'object') return channel.config;
+  try {
+    return JSON.parse(channel.config);
+  } catch {
+    return {};
+  }
+}
+
+// getChannelTransportLabel renders the effective outbound transport for the
+// Channels type column: a smtp/outbound channel whose config selects
+// graph_send_provider sends through Microsoft Graph, not SMTP, and the type
+// column must not claim otherwise. Inbound/other types keep their type label.
+export function getChannelTransportLabel(channel) {
+  const config = getChannelConfig(channel);
+  if (channel?.type === 'smtp' && config.graph_send_provider === 'graph') {
+    return 'Graph';
+  }
+  return channel?.type ?? '';
 }

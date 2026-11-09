@@ -120,7 +120,12 @@
     encryption: 'tls',
     skip_tls_verify: false,
     auth_method: 'auto',
-    enabled: false
+    enabled: false,
+    send_provider: 'smtp',
+    graph_tenant_id: '',
+    graph_client_id: '',
+    graph_client_secret: '',
+    graph_mailbox_upn: ''
   });
 
   // Form channel configuration form data
@@ -280,7 +285,12 @@
           encryption: config.smtp_encryption || 'tls',
           skip_tls_verify: config.smtp_skip_tls_verify || false,
           auth_method: config.smtp_auth_method || 'auto',
-          enabled: channel.status === 'enabled'
+          enabled: channel.status === 'enabled',
+          send_provider: config.graph_send_provider === 'graph' ? 'graph' : 'smtp',
+          graph_tenant_id: config.graph_tenant_id || '',
+          graph_client_id: config.graph_client_id || '',
+          graph_client_secret: '',
+          graph_mailbox_upn: config.graph_mailbox_upn || ''
         };
       } else if (channel.type === 'form') {
         formChannelFormData = {

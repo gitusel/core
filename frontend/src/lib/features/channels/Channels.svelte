@@ -27,7 +27,7 @@
   import DataTable from '../../components/DataTable.svelte';
   import ChannelNavigation from './ChannelNavigation.svelte';
   import TabStrip from '../../components/TabStrip.svelte';
-  import { channelTypes as channelTypeDefs, allTypesEntry, getChannelTypeIcon } from './channelTypes.js';
+  import { channelTypes as channelTypeDefs, allTypesEntry, getChannelTypeIcon, getChannelTransportLabel } from './channelTypes.js';
   import { channelAdminRoute } from './channelRoutes.js';
   import CategoryModal from '../../dialogs/CategoryModal.svelte';
   import ChannelConfigModal from '../../dialogs/ChannelConfigModal.svelte';
@@ -82,9 +82,17 @@
   let filteredChannels = $derived(() => {
     let result = channels;
 
-    // Filter by type
+    // Filter by type. 'graph' is a virtual filter for smtp/outbound channels
+    // whose config selects graph_send_provider — Graph transport lives inside
+    // type "smtp", so the raw type match would hide them behind the SMTP chip.
     if (activeTypeFilter !== null) {
-      result = result.filter(c => c.type === activeTypeFilter);
+      if (activeTypeFilter === 'graph') {
+        result = result.filter(c => getChannelTransportLabel(c) === 'Graph');
+      } else if (activeTypeFilter === 'smtp') {
+        result = result.filter(c => c.type === 'smtp' && getChannelTransportLabel(c) !== 'Graph');
+      } else {
+        result = result.filter(c => c.type === activeTypeFilter);
+      }
     }
 
     // Filter by category
@@ -302,12 +310,14 @@
   }
 
   function showAddChannelForm() {
-    const filteredType = channelTypeDefs.some(type => type.id === activeTypeFilter)
+    // The Graph filter preselects the virtual graph type; handleChannelSubmit
+    // normalizes it to smtp + graph_send_provider for the backend.
+    const createType = channelTypeDefs.some(type => type.id === activeTypeFilter)
       ? activeTypeFilter
       : 'portal';
     channelFormData = {
       name: '',
-      type: filteredType,
+      type: createType,
       description: '',
       category_id: activeCategoryId ? parseInt(activeCategoryId) : null,
       slug: ''
@@ -330,6 +340,10 @@
     if (creating) return;
     try {
       creating = true;
+      // The create form exposes Graph as a type choice; the backend only knows
+      // type smtp, so it normalizes to smtp/outbound with graph_send_provider.
+      const isGraphCreate = channelFormData.type === 'graph';
+      const backendType = isGraphCreate ? 'smtp' : channelFormData.type;
       // Auto-determine direction based on type
       const directionMap = {
         'portal': 'inbound',
@@ -338,12 +352,22 @@
         'email': 'inbound',
         'smtp': 'outbound'
       };
-      const direction = directionMap[channelFormData.type] || 'outbound';
+      const direction = directionMap[backendType] || 'outbound';
 
       const channelData = {
         ...channelFormData,
+        type: backendType,
         direction,
-        category_id: channelFormData.category_id || null
+        category_id: channelFormData.category_id || null,
+        ...(isGraphCreate
+          ? {
+              config: JSON.stringify({
+                graph_send_provider: 'graph',
+                smtp_port: 587,
+                smtp_from_email: ''
+              })
+            }
+          : {})
       };
 
       const newChannel = await channelsApi.create(channelData);
@@ -603,7 +627,9 @@
         {/snippet}
 
         {#snippet type(item)}
-          <span class="capitalize" style="color: var(--ds-text);">{item.type}</span>
+          <span class="capitalize" style="color: var(--ds-text);">
+            {getChannelTransportLabel(item)}
+          </span>
         {/snippet}
 
         {#snippet status(item)}
