@@ -3301,6 +3301,67 @@ var Catalog = []Migration{
 			ALTER TABLE user_integration_tokens ADD COLUMN IF NOT EXISTS invalidated_at TIMESTAMPTZ;
 		`,
 	},
+	{
+		Version:       "20261121_item_due_reminders_delivered",
+		Name:          "Track whether a due-date reminder was delivered so skipped candidates can be retried",
+		CheckSQLite:   sqliteColumnCheck("item_due_reminders", "delivered"),
+		CheckPostgres: pgColumnCheck("item_due_reminders", "delivered"),
+		// Existing rows predate the distinction and are treated as delivered so
+		// the sweep keeps its previous behavior. New skipped rows carry
+		// delivered=false and are retried after the retry backoff.
+		SQLite: `
+			ALTER TABLE item_due_reminders ADD COLUMN delivered BOOLEAN NOT NULL DEFAULT TRUE;
+		`,
+		Postgres: `
+			ALTER TABLE item_due_reminders ADD COLUMN IF NOT EXISTS delivered BOOLEAN NOT NULL DEFAULT TRUE;
+		`,
+	},
+	{
+		Version:       "20261121_theme_branding",
+		Name:          "Add full-logo and brand layout columns to themes",
+		CheckSQLite:   sqliteColumnCheck("themes", "brand_layout"),
+		CheckPostgres: pgColumnCheck("themes", "brand_layout"),
+		SQLite: `
+			ALTER TABLE themes ADD COLUMN logo_full_url TEXT;
+			ALTER TABLE themes ADD COLUMN logo_full_url_dark TEXT;
+			ALTER TABLE themes ADD COLUMN brand_layout TEXT NOT NULL DEFAULT 'mark_text';
+		`,
+		Postgres: `
+			ALTER TABLE themes ADD COLUMN IF NOT EXISTS logo_full_url TEXT;
+			ALTER TABLE themes ADD COLUMN IF NOT EXISTS logo_full_url_dark TEXT;
+			ALTER TABLE themes ADD COLUMN IF NOT EXISTS brand_layout TEXT NOT NULL DEFAULT 'mark_text';
+		`,
+	},
+	{
+		Version:       "20261122_plane_import_mappings",
+		Name:          "External-id map for the Plane importer (idempotent re-runs, provenance)",
+		CheckSQLite:   `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='plane_import_mappings'`,
+		CheckPostgres: `SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='plane_import_mappings'`,
+		SQLite: `
+CREATE TABLE IF NOT EXISTS plane_import_mappings (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	entity_type TEXT NOT NULL,
+	external_id TEXT NOT NULL,
+	windshift_id INTEGER NOT NULL,
+	metadata_json TEXT,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(workspace_id, entity_type, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_plane_import_mappings_windshift ON plane_import_mappings(workspace_id, entity_type, windshift_id);`,
+		Postgres: `
+CREATE TABLE IF NOT EXISTS plane_import_mappings (
+	id SERIAL PRIMARY KEY,
+	workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+	entity_type TEXT NOT NULL,
+	external_id TEXT NOT NULL,
+	windshift_id INTEGER NOT NULL,
+	metadata_json TEXT,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	UNIQUE(workspace_id, entity_type, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_plane_import_mappings_windshift ON plane_import_mappings(workspace_id, entity_type, windshift_id);`,
+	},
 }
 
 // isNumericJSONKey reports whether a custom-field value key is a numeric field

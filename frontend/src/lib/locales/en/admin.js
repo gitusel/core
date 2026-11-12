@@ -21,6 +21,14 @@ export default {
     systemDefault: 'System Default',
     themeManager: {
       background: 'Background', text: 'Text',
+      brandLayout: 'Sidebar brand',
+      brandLayoutMarkText: 'Mark + text',
+      brandLayoutMarkOnly: 'Mark only',
+      brandLayoutFullLogo: 'Full logo',
+      brandLayoutHelp: 'Controls the expanded sidebar. The collapsed sidebar always shows the mark.',
+      brandPreview: 'Sidebar preview',
+      brandPreviewExpanded: 'Expanded',
+      brandPreviewCollapsed: 'Collapsed',
       failedToLoad: 'Failed to load themes.', failedToCreate: 'Failed to create theme.',
       failedToUpdate: 'Failed to update theme.', failedToDelete: 'Failed to delete theme.',
       failedToActivate: 'Failed to activate theme.', failedToUploadLogo: 'Failed to upload logo.',
@@ -31,6 +39,18 @@ export default {
       },
     },
 
+    // Instance-wide general configuration (site title and future fields)
+    generalSettings: {
+      title: 'General',
+      subtitle: 'Instance-wide configuration',
+      siteIdentity: 'Site identity',
+      siteIdentityDescription:
+        'The product name shown in the browser tab, the sidebar, and on the login and setup screens.',
+      siteTitle: 'Site title',
+      preview: 'Preview',
+      saved: 'General settings saved',
+    },
+
     // Admin settings
     admin: 'Administration',
     systemSettings: 'System Settings',
@@ -39,6 +59,7 @@ export default {
 
     // Admin panel group labels (for Admin.svelte)
     adminGroups: {
+      general: 'General',
       contentStructure: 'Content & Structure',
       workflowProcess: 'Workflow & Process',
       integrationLinks: 'Integration & Links',
@@ -50,6 +71,7 @@ export default {
 
     // Admin panel item labels and descriptions (for Admin.svelte)
     adminItems: {
+      general: { title: 'General', description: 'Instance-wide configuration such as the site title' },
       customFields: { title: 'Custom Fields', description: 'Manage custom field definitions' },
       screens: { title: 'Screens', description: 'Configure form screens and layouts' },
       hierarchyLevels: {
@@ -337,6 +359,10 @@ export default {
       importing: 'Importing…',
       importWarning: 'The configuration set was imported with warnings.',
       importFailed: 'Failed to import the configuration set.',
+      importNameTitle: 'Name the imported set',
+      importNameDescription:
+        'Importing creates a copy. Choose a name for the imported set.',
+      importInvalidFile: 'That file is not a configuration set template.',
       unresolvedReferencesHeading: 'The import references entities that do not exist on this instance.',
       defaultConflictHeading: 'The import conflicts with a default entity on this instance.',
       unresolvedImportTitle: 'Import: unresolved references',
@@ -979,11 +1005,6 @@ export default {
         dependency_analysis: {
           name: 'Dependency Analysis',
           description: 'Analyze and suggest dependencies between items',
-        },
-        logbook_articles: {
-          name: 'Logbook Articles',
-          description:
-            'AI-powered document classification, cleaning, and article generation for logbook',
         },
       },
     },

@@ -18,6 +18,7 @@ import (
 
 	"windshift/internal/itemevents"
 	"windshift/internal/jira"
+	"windshift/internal/jiraimport"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/sanitize"
@@ -958,7 +959,10 @@ func affectedVersionOptionValues(issue *jira.JiraIssue, field *jiraAffectsVersio
 // before watchers and labels reference the item, and attachments must import
 // before the description re-render links media to them.
 func (h *JiraImportHandler) importIssue(ctx context.Context, im *jiraImportContext, issue *jira.JiraIssue) error {
-	refs := h.resolveJiraIssueReferences(im, issue)
+	refs, err := h.resolveJiraIssueReferences(im, issue)
+	if err != nil {
+		return err
+	}
 	resolver := im.mentionResolver()
 	rawDescription, description := convertJiraIssueDescription(issue, resolver)
 
@@ -1005,9 +1009,40 @@ func (h *JiraImportHandler) previousSubresourceMapping(jobID, entityType, jiraID
 	return previous, nil
 }
 
+// ensurePriority resolves a Jira priority onto a Windshift catalog priority.
+// Known Jira names collapse onto the canonical catalog priorities; custom names
+// are created on demand. Results are cached for the rest of the import.
+func (h *JiraImportHandler) ensurePriority(im *jiraImportContext, jiraPriorityName string) (*int, error) {
+	name := strings.TrimSpace(jiraPriorityName)
+	if name == "" {
+		return nil, nil
+	}
+	cacheKey := strings.ToLower(name)
+	if im.priorityMap == nil {
+		im.priorityMap = make(map[string]int)
+	}
+	if id, ok := im.priorityMap[cacheKey]; ok {
+		return &id, nil
+	}
+	target, _ := jira.PriorityMappingTarget(name)
+	priority, created, err := h.imports.EnsureImportedPriority(
+		im.workspaceID, target, jiraimport.ImportedPriorityIcon, jiraimport.ImportedPriorityColor,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Jira priority %q: %w", name, err)
+	}
+	if created {
+		slog.Info("Created Windshift priority for custom Jira priority",
+			slog.String("component", "jira"), slog.String("jira_priority", name),
+			slog.String("windshift_priority", target), slog.Int("priority_id", priority.ID))
+	}
+	im.priorityMap[cacheKey] = priority.ID
+	return &priority.ID, nil
+}
+
 // resolveJiraIssueReferences maps the issue's direct Jira fields onto
 // Windshift identities through the import context's reference maps.
-func (h *JiraImportHandler) resolveJiraIssueReferences(im *jiraImportContext, issue *jira.JiraIssue) *jiraIssueReferences {
+func (h *JiraImportHandler) resolveJiraIssueReferences(im *jiraImportContext, issue *jira.JiraIssue) (*jiraIssueReferences, error) {
 	refs := &jiraIssueReferences{}
 
 	if issue.Fields.Status != nil {
@@ -1076,11 +1111,15 @@ func (h *JiraImportHandler) resolveJiraIssueReferences(im *jiraImportContext, is
 		}
 	}
 
-	// Map priority through the synonym table so Jira-only names (Highest, Lowest,
-	// Blocker, Major, Minor, Trivial) land on canonical Windshift priorities
-	// instead of falling back to the workspace default.
-	if issue.Fields.Priority != nil && issue.Fields.Priority.Name != "" {
-		refs.priorityName = jira.SuggestPriorityMapping(issue.Fields.Priority.Name)
+	// Known Jira priority names collapse onto Windshift's canonical catalog;
+	// custom names are preserved and created on demand so no source value is
+	// silently flattened to the default.
+	if issue.Fields.Priority != nil && strings.TrimSpace(issue.Fields.Priority.Name) != "" {
+		priorityID, err := h.ensurePriority(im, issue.Fields.Priority.Name)
+		if err != nil {
+			return nil, err
+		}
+		refs.priorityID = priorityID
 	}
 
 	if issue.Fields.DueDate != "" {
@@ -1106,7 +1145,7 @@ func (h *JiraImportHandler) resolveJiraIssueReferences(im *jiraImportContext, is
 	refs.iterationID = extractSprintIterationID(&issue.Fields, im.customFieldMappings, im.iterationMap)
 	refs.storyPoints = importedStoryPoints(im.customFieldMappings, &issue.Fields)
 
-	return refs
+	return refs, nil
 }
 
 // convertJiraIssueDescription renders the ADF description to markdown without
@@ -1353,7 +1392,7 @@ func (h *JiraImportHandler) upsertJiraIssueItem(im *jiraImportContext, issue *ji
 		Description:             description,
 		StatusID:                refs.statusID,
 		ItemTypeID:              refs.itemTypeID,
-		Priority:                refs.priorityName,
+		PriorityID:              refs.priorityID,
 		DueDate:                 refs.dueDate,
 		AssigneeID:              refs.assigneeID,
 		ReporterID:              refs.reporterID,
@@ -2160,6 +2199,11 @@ func jiraInternalAttachmentIDs(issue *jira.JiraIssue, rawDescription any, servic
 	return internal
 }
 
+// errJiraAttachmentDownloadSkipped marks a staged attachment that the download
+// pool never reached because the import context was canceled. It keeps an
+// un-attempted entry from being written as a record with an empty file path.
+var errJiraAttachmentDownloadSkipped = errors.New("attachment download skipped because the import stopped")
+
 // jiraAttachmentDownload is one attachment staged for download. The concurrent
 // phase fills the stored fields; the record-writing phase consumes them in
 // attachment order.
@@ -2183,7 +2227,12 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 		return nil, nil
 	}
 
+	progress.TotalAttachments += len(issue.Fields.Attachment)
+
 	if !h.storage.Enabled() {
+		// Intentionally disabled storage: count these separately from a failed
+		// attempted download so the terminal outcome is not misread as success.
+		progress.SkippedAttachments += len(issue.Fields.Attachment)
 		slog.Warn("Attachment storage not configured, skipping attachment import",
 			slog.String("component", "jira"), slog.String("issue", issue.Key))
 		return jiraNoAttachmentMediaRefs()
@@ -2196,11 +2245,10 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 	// goroutine so mapping order and DB access remain deterministic.
 	var downloads []*jiraAttachmentDownload
 	for _, attachment := range issue.Fields.Attachment {
-		if attachment.Content == "" {
+		if attachment.ID == "" && attachment.Content == "" {
+			progress.SkippedAttachments++
 			continue
 		}
-
-		progress.TotalAttachments++
 
 		previousMapping, lookupErr := h.previousSubresourceMapping(jobID, "attachment", attachment.ID, itemID, forked)
 		if lookupErr != nil {
@@ -2235,7 +2283,12 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			}
 		}
 
-		downloads = append(downloads, &jiraAttachmentDownload{attachment: attachment})
+		// Seed the error so an entry the pool never reaches is not mistaken for a
+		// successful download with an empty path.
+		downloads = append(downloads, &jiraAttachmentDownload{
+			attachment: attachment,
+			err:        errJiraAttachmentDownloadSkipped,
+		})
 	}
 
 	jiraParallel(ctx, h.importConcurrency, len(downloads), func(ctx context.Context, i int) {
@@ -2246,7 +2299,12 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 
 	for _, download := range downloads {
 		attachment := download.attachment
+		if errors.Is(download.err, errJiraAttachmentDownloadSkipped) {
+			progress.FailedAttachments++
+			continue
+		}
 		if download.err != nil {
+			progress.FailedAttachments++
 			slog.Error("Failed to store Jira attachment",
 				slog.String("component", "jira"),
 				slog.String("issue", issue.Key),
@@ -2275,6 +2333,7 @@ func (h *JiraImportHandler) importAttachments(ctx context.Context, jobID string,
 			IsInternal:       internalIDs[attachment.ID],
 		})
 		if err != nil {
+			progress.FailedAttachments++
 			slog.Error("Failed to insert attachment record",
 				slog.String("component", "jira"),
 				slog.String("issue", issue.Key),
@@ -2359,7 +2418,7 @@ func sniffAttachmentMimeType(f *os.File) (string, error) {
 // file is always removed. Returns the stored path, stored filename, detected
 // MIME type, and size.
 func (h *JiraImportHandler) storeJiraAttachment(ctx context.Context, attachment jira.JiraAttachment, client jira.Client) (storedPath, storedFilename, mimeType string, size int64, err error) {
-	reader, _, err := client.DownloadAttachment(ctx, attachment.Content)
+	reader, _, err := client.DownloadAttachment(ctx, attachment.ID, attachment.Content)
 	if err != nil {
 		return "", "", "", 0, fmt.Errorf("download: %w", err)
 	}

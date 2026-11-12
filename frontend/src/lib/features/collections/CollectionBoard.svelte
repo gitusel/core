@@ -48,7 +48,7 @@
   } from './swimlanes.js';
   import { confirm } from '../../composables/useConfirm.js';
   import { resolveBoardWorkspaces } from './boardWorkspaces.js';
-  import { infoToast, successToast, warningToast } from '../../stores/toasts.svelte.js';
+  import { infoToast, successToast, warningToast, surfaceError } from '../../stores/toasts.svelte.js';
   import Plus from '@lucide/svelte/icons/plus';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
@@ -230,8 +230,18 @@
   // Backlog functionality
   let backlogItems = $derived(collectionStore.backlogItems);
 
-  // Iteration filter state
-  let allIterations = $state([]);
+  // Iteration filter state. When bootstrap delivered the complete directory
+  // the list mirrors the shared store, so a reference refresh reaches a mounted
+  // board; otherwise it holds the locally fetched page.
+  let fetchedIterations = $state([]);
+  const workspaceIsPersonal = $derived(workspaceDataStore.workspace?.is_personal === true);
+  let allIterations = $derived(
+    workspaceDataStore.planningCompleteness?.iterations === true
+      ? (workspaceDataStore.iterations || []).filter(
+          (iteration) => !workspaceIsPersonal || !iteration.is_global
+        )
+      : fetchedIterations
+  );
   let iterationFilterId = $state(null);
 
   // Board grouping: null, item-type lanes, or milestone lanes.
@@ -535,21 +545,15 @@
     if (requestedView !== viewSignature) return;
 
     try {
-      const isPersonal = workspaceDataStore.workspace?.is_personal === true;
-      let iters;
-      if (workspaceDataStore.planningCompleteness?.iterations === true) {
-        // Complete bootstrap data avoids a second full iteration fetch.
-        iters = (workspaceDataStore.iterations || []).filter(
-          (iteration) => !isPersonal || !iteration.is_global
-        );
-      } else {
-        iters = await iterationsApi.getAll({
+      // Complete bootstrap data drives the derived list; a truncated directory
+      // still needs its own fetch.
+      if (workspaceDataStore.planningCompleteness?.iterations !== true) {
+        fetchedIterations = (await iterationsApi.getAll({
           workspace_id: requestedWorkspaceId,
-          include_global: !isPersonal,
-        });
+          include_global: !workspaceIsPersonal,
+        })) || [];
       }
       if (requestedView !== viewSignature) return;
-      allIterations = iters || [];
 
       const storedIteration = collectionPreferences.viewStateValue(
         workspaceId,
@@ -590,6 +594,15 @@
     }
   });
 
+  // A reference refresh can remove the filtered iteration (or the last one), so
+  // drop the stale filter instead of keeping a lane that no longer exists.
+  $effect(() => {
+    if (iterationFilterId == null) return;
+    if (!allIterations.some((iteration) => iteration.id === iterationFilterId)) {
+      setIterationFilter(null);
+    }
+  });
+
   // Keep backlog count in sync
   $effect(() => {
     backlogStore.setCount(workspaceId, collectionStore.backlogPagination?.total_items ?? collectionStore.backlogItems.length);
@@ -608,7 +621,7 @@
     setupViewSignature = view;
     dependencyLoader.reset();
     visibleBoardItemIds = new Set();
-    allIterations = [];
+    fetchedIterations = [];
     iterationFilterId = null;
     boardGroupBy = null;
     excludeRightmostSwimlaneParents = false;
@@ -1301,7 +1314,6 @@
         id: `group-type-${type.id}`,
         testid: `board-group-by-type-${type.id}`,
         title: type.name,
-        subtitle: t('boardControls.useAsSwimlanes'),
         itemType: type,
         selected:
           boardGroupBy?.dimension === BOARD_GROUP_BY_ITEM_TYPE && boardGroupBy.itemTypeId === type.id,
@@ -1690,9 +1702,6 @@
     } finally {
       bulkBusy = false;
       clearSelection();
-      // Keep the shared label directory in sync so newly created labels appear
-      // on cards and in other pickers.
-      void workspaceDataStore.invalidate('labels');
       reloadCollection();
     }
   }
@@ -1850,11 +1859,25 @@
       });
   }
 
+  // Board rows are summaries (fields=summary), so load the full item before
+  // opening the screen; its stored values seed the displayed fields.
+  async function openBoardTransition(item, targetStatusId, targetName, laneTarget, screen) {
+    let sourceItem = item;
+    try {
+      const full = await itemsApi.get(item.id);
+      if (full) sourceItem = full;
+    } catch (err) {
+      // The board row still opens the screen; only the seed values are lost.
+      surfaceError(err, { context: 'loadBoardTransitionItem', silent: true });
+    }
+    boardTransition = { item: sourceItem, targetStatusId, targetName, laneTarget, screen };
+    showBoardTransition = true;
+  }
+
   async function moveItemToStatus(item, targetStatusId, targetName) {
     const screen = await resolveTransitionScreen(item.id, targetStatusId);
     if (screen) {
-      boardTransition = { item, targetStatusId, targetName, screen };
-      showBoardTransition = true;
+      await openBoardTransition(item, targetStatusId, targetName, null, screen);
       return;
     }
     await performMoveItemToStatus(item, targetStatusId, targetName, null);
@@ -1862,17 +1885,21 @@
 
   async function handleBoardTransitionConfirm(fields) {
     if (!boardTransition) return;
-    const { item, targetStatusId, targetName } = boardTransition;
+    const { item, targetStatusId, targetName, laneTarget } = boardTransition;
     boardTransition = null;
-    await performMoveItemToStatus(item, targetStatusId, targetName, fields);
+    await performMoveItemToStatus(item, targetStatusId, targetName, fields, laneTarget);
   }
 
-  async function performMoveItemToStatus(item, targetStatusId, targetName, fields) {
+  async function performMoveItemToStatus(item, targetStatusId, targetName, fields, laneTarget = null) {
     const previousStatusId = item.status_id;
     updateLocalItemStatus(item.id, targetStatusId);
     try {
-      const transitionedItem = await itemsApi.transition(item.id, targetStatusId, fields);
+      let transitionedItem = await itemsApi.transition(item.id, targetStatusId, fields);
       mergeLocalItem(item.id, transitionedItem);
+      if (laneTarget) {
+        transitionedItem = await applyLaneTarget(transitionedItem, laneTarget);
+        mergeLocalItem(item.id, transitionedItem);
+      }
       boardAnnouncement = `Moved ${item.title} to ${targetName}`;
       successToast(boardAnnouncement);
       reloadCollection();
@@ -2036,7 +2063,23 @@
         if (!(await confirmMilestoneLaneDrop(data.item, laneTarget))) return;
 
         const previousStatusId = data.item.status_id;
-        if (!isSameStatus) updateLocalItemStatus(data.item.id, transitionStatusId);
+        if (!isSameStatus) {
+          // A screen-bearing move pauses on the modal; the confirm handler runs
+          // the transition with the collected fields and lane target.
+          const screen = await resolveTransitionScreen(data.item.id, transitionStatusId);
+          if (screen) {
+            const targetStatus = statuses.find((status) => status.id === transitionStatusId);
+            await openBoardTransition(
+              data.item,
+              transitionStatusId,
+              targetStatus?.name || '',
+              laneTarget,
+              screen
+            );
+            return;
+          }
+          updateLocalItemStatus(data.item.id, transitionStatusId);
+        }
         try {
           let droppedItem = data.item;
           if (!isSameStatus) {
@@ -2145,13 +2188,13 @@
         const screen = await resolveTransitionScreen(preparedItem.id, targetStatusId);
         if (screen) {
           const targetStatus = statuses.find((status) => status.id === targetStatusId);
-          boardTransition = {
-            item: preparedItem,
+          await openBoardTransition(
+            preparedItem,
             targetStatusId,
-            targetName: targetStatus?.name || '',
-            screen,
-          };
-          showBoardTransition = true;
+            targetStatus?.name || '',
+            laneTarget,
+            screen
+          );
           return null;
         }
         updateLocalItemStatus(preparedItem.id, targetStatusId);
@@ -2221,11 +2264,17 @@
         >
           {#snippet actions()}
             <div class="flex flex-wrap items-center justify-end gap-3">
-              {#if allIterations.length > 0}
-                <div class="inline-flex items-center rounded-lg border overflow-hidden text-sm"
-                     style="background-color: var(--ctx-surface, transparent); backdrop-filter: var(--ctx-backdrop, none); border-color: var(--ctx-border, var(--ds-border));">
+              <!-- The filter bar is only useful with an option to pick or an
+                   active filter to clear; a lone "All Items" tab would be a
+                   no-op. -->
+              {#if iterationFilterOptions.length > 0 || iterationFilterId}
+                <div
+                  class="inline-flex items-center rounded-lg border overflow-hidden text-sm"
+                  data-testid="board-iteration-filter"
+                  style="background-color: var(--ctx-surface, transparent); backdrop-filter: var(--ctx-backdrop, none); border-color: var(--ctx-border, var(--ds-border));">
                   <button
                     class="px-3 py-1.5 transition-colors"
+                    data-testid="board-iteration-filter-all"
                     style={!iterationFilterId
                       ? 'background-color: var(--ctx-surface-raised, var(--ds-surface-raised)); color: var(--ds-text); font-weight: 500;'
                       : 'color: var(--ds-text); background-color: transparent;'}
@@ -2780,6 +2829,7 @@
     targetStatusName={boardTransition.targetName}
     workspaceId={boardTransition.item?.workspace_id}
     itemLabels={boardTransition.item?.labels || []}
+    item={boardTransition.item}
     onconfirm={handleBoardTransitionConfirm}
     oncancel={() => (boardTransition = null)}
   />

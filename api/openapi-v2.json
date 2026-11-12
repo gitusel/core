@@ -31390,6 +31390,10 @@
           "data": {
             "additionalProperties": false,
             "properties": {
+              "calendar": {
+                "description": "The calendar value.",
+                "type": "string"
+              },
               "color_mode": {
                 "description": "The color mode value.",
                 "type": "string"
@@ -31418,6 +31422,10 @@
                 "description": "The theme value.",
                 "nullable": true,
                 "properties": {
+                  "brand_layout": {
+                    "description": "The brand layout value.",
+                    "type": "string"
+                  },
                   "builtin_key": {
                     "description": "The builtin key value.",
                     "type": "string"
@@ -31450,6 +31458,14 @@
                   "is_default": {
                     "description": "The is default value.",
                     "type": "boolean"
+                  },
+                  "logo_full_url": {
+                    "description": "The logo full url value.",
+                    "type": "string"
+                  },
+                  "logo_full_url_dark": {
+                    "description": "The logo full url dark value.",
+                    "type": "string"
                   },
                   "logo_url": {
                     "description": "The logo url value.",
@@ -31486,6 +31502,7 @@
                   }
                 },
                 "required": [
+                  "brand_layout",
                   "created_at",
                   "description",
                   "display_name",
@@ -31539,6 +31556,7 @@
               }
             },
             "required": [
+              "calendar",
               "color_mode",
               "comment_sort_order",
               "due_date_reminder_days",
@@ -31606,6 +31624,10 @@
                 "description": "The last name value.",
                 "type": "string"
               },
+              "requires_password_reset": {
+                "description": "The requires password reset value.",
+                "type": "boolean"
+              },
               "timezone": {
                 "description": "The timezone value.",
                 "type": "string"
@@ -31626,6 +31648,7 @@
               "is_agent",
               "language",
               "last_name",
+              "requires_password_reset",
               "timezone",
               "username"
             ],
@@ -59677,6 +59700,11 @@
       "PatchUsersMePreferencesPayload": {
         "additionalProperties": false,
         "properties": {
+          "calendar": {
+            "description": "The calendar value.",
+            "nullable": true,
+            "type": "string"
+          },
           "color_mode": {
             "description": "The color mode value.",
             "nullable": true,
@@ -59753,6 +59781,10 @@
           "data": {
             "additionalProperties": false,
             "properties": {
+              "calendar": {
+                "description": "The calendar value.",
+                "type": "string"
+              },
               "color_mode": {
                 "description": "The color mode value.",
                 "type": "string"
@@ -59781,6 +59813,10 @@
                 "description": "The theme value.",
                 "nullable": true,
                 "properties": {
+                  "brand_layout": {
+                    "description": "The brand layout value.",
+                    "type": "string"
+                  },
                   "builtin_key": {
                     "description": "The builtin key value.",
                     "type": "string"
@@ -59813,6 +59849,14 @@
                   "is_default": {
                     "description": "The is default value.",
                     "type": "boolean"
+                  },
+                  "logo_full_url": {
+                    "description": "The logo full url value.",
+                    "type": "string"
+                  },
+                  "logo_full_url_dark": {
+                    "description": "The logo full url dark value.",
+                    "type": "string"
                   },
                   "logo_url": {
                     "description": "The logo url value.",
@@ -59849,6 +59893,7 @@
                   }
                 },
                 "required": [
+                  "brand_layout",
                   "created_at",
                   "description",
                   "display_name",
@@ -59902,6 +59947,7 @@
               }
             },
             "required": [
+              "calendar",
               "color_mode",
               "comment_sort_order",
               "due_date_reminder_days",
