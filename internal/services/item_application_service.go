@@ -79,6 +79,9 @@ type ItemApplicationService struct {
 	bulk       *ItemUpdateService
 	mentions   *MentionService
 	comments   *CommentService
+	// assetPerm gates asset titles in history; nil means asset references are
+	// left unresolved rather than leaking a title the viewer cannot see.
+	assetPerm AssetPermissionChecker
 	// clock is the SLA evaluation clock. Reporting must share it so an
 	// ongoing-breach snapshot matches the engine's "now"; nil means wall time.
 	clock sla.Clock
@@ -145,6 +148,13 @@ func (s *ItemApplicationService) WithMutationEffects(mentions *MentionService) *
 // collected by a transition screen.
 func (s *ItemApplicationService) WithComments(comments *CommentService) *ItemApplicationService {
 	s.comments = comments
+	return s
+}
+
+// WithAssetPermissions lets history resolve asset references only for viewers
+// who can see the asset's set.
+func (s *ItemApplicationService) WithAssetPermissions(checker AssetPermissionChecker) *ItemApplicationService {
+	s.assetPerm = checker
 	return s
 }
 
@@ -1884,9 +1894,15 @@ func (s *ItemApplicationService) History(ctx context.Context, userID, itemID int
 	if err != nil {
 		return nil, err
 	}
-	allowedProjects := s.allowedProjectIDs(userID)
+	resolution := &historyResolution{
+		userID:          userID,
+		allowedProjects: s.allowedProjectIDs(userID),
+		// One cache per history read: a long feed repeats the same workspace,
+		// status, or user id across rows, and each miss is a database round trip.
+		names: map[string]string{},
+	}
 	for i := range history {
-		s.resolveHistory(&history[i], allowedProjects)
+		s.resolveHistory(&history[i], resolution)
 	}
 	return history, nil
 }
@@ -2269,20 +2285,43 @@ func (s *ItemApplicationService) allowedProjectIDs(userID int) map[int]struct{} 
 	return allowed
 }
 
-func (s *ItemApplicationService) resolveHistory(entry *models.ItemHistory, allowedProjects map[int]struct{}) {
+func (s *ItemApplicationService) resolveHistory(entry *models.ItemHistory, res *historyResolution) {
+	if name := s.resolveHistoryFieldName(entry.FieldName, res); name != "" {
+		entry.ResolvedFieldName = &name
+	}
 	if entry.OldValue != nil && *entry.OldValue != "" {
-		if value := s.resolveHistoryValue(entry.FieldName, *entry.OldValue, allowedProjects); value != "" {
+		if value := s.resolveHistoryValue(entry.FieldName, *entry.OldValue, res); value != "" {
 			entry.ResolvedOldValue = &value
 		}
 	}
 	if entry.NewValue != nil && *entry.NewValue != "" {
-		if value := s.resolveHistoryValue(entry.FieldName, *entry.NewValue, allowedProjects); value != "" {
+		if value := s.resolveHistoryValue(entry.FieldName, *entry.NewValue, res); value != "" {
 			entry.ResolvedNewValue = &value
 		}
 	}
 }
 
-func (s *ItemApplicationService) resolveHistoryValue(field, value string, allowedProjects map[int]struct{}) string {
+func (s *ItemApplicationService) resolveHistoryFieldName(field string, res *historyResolution) string {
+	cacheKey := "name\x00" + field
+	if name, ok := res.names[cacheKey]; ok {
+		return name
+	}
+	name := s.resolveHistoryFieldNameUncached(field, res)
+	res.names[cacheKey] = name
+	return name
+}
+
+func (s *ItemApplicationService) resolveHistoryValue(field, value string, res *historyResolution) string {
+	cacheKey := field + "\x00" + value
+	if resolved, ok := res.names[cacheKey]; ok {
+		return resolved
+	}
+	resolved := s.resolveHistoryValueUncached(field, value, res)
+	res.names[cacheKey] = resolved
+	return resolved
+}
+
+func (s *ItemApplicationService) resolveHistoryValueUncached(field, value string, res *historyResolution) string {
 	if field == "milestones" {
 		names := make([]string, 0)
 		for _, part := range strings.Split(value, ",") {
@@ -2294,13 +2333,23 @@ func (s *ItemApplicationService) resolveHistoryValue(field, value string, allowe
 		}
 		return strings.Join(names, ", ")
 	}
+	if name := s.resolveCustomFieldValue(field, value, res); name != "" {
+		return name
+	}
+	if name := s.resolveVirtualFieldValue(field, value, res); name != "" {
+		return name
+	}
 	id, err := strconv.Atoi(value)
 	if err != nil {
 		return ""
 	}
 	switch field {
-	case "assignee_id":
+	case "assignee_id", "creator_id", "reporter_id":
 		return s.resolver.ResolveUserName(id)
+	case "creator_portal_customer_id":
+		return s.resolver.ResolvePortalCustomerName(id)
+	case "workspace_id":
+		return s.resolver.ResolveWorkspaceName(id)
 	case "team_id":
 		return s.resolver.ResolveTeamName(id)
 	case "priority_id":
@@ -2309,9 +2358,14 @@ func (s *ItemApplicationService) resolveHistoryValue(field, value string, allowe
 		return s.resolver.ResolveStatusName(id)
 	case "parent_id", "merged_into_item_id", "merged_item_id", "split_item_id":
 		return s.resolver.ResolveItemKey(id)
-	case "project_id":
-		if allowedProjects != nil {
-			if _, allowed := allowedProjects[id]; !allowed {
+	case "related_work_item_id":
+		if !s.relatedItemVisible(res.userID, id) {
+			return ""
+		}
+		return s.resolver.ResolveItemKey(id)
+	case "project_id", "time_project_id":
+		if res.allowedProjects != nil {
+			if _, allowed := res.allowedProjects[id]; !allowed {
 				return ""
 			}
 		}
@@ -2320,9 +2374,25 @@ func (s *ItemApplicationService) resolveHistoryValue(field, value string, allowe
 		return s.resolver.ResolveMilestoneName(id)
 	case "item_type_id":
 		return s.resolver.ResolveItemTypeName(id)
+	case "iteration_id":
+		return s.resolver.ResolveIterationName(id)
 	default:
 		return ""
 	}
+}
+
+// relatedItemVisible reports whether the viewer can see a related work item,
+// so history never reveals the key of an item in an inaccessible workspace.
+func (s *ItemApplicationService) relatedItemVisible(userID, itemID int) bool {
+	workspaceID, err := s.items.GetWorkspaceID(itemID)
+	if err != nil {
+		return false
+	}
+	allowed, err := s.perm.HasWorkspacePermission(userID, workspaceID, models.PermissionItemView)
+	if err != nil {
+		return false
+	}
+	return allowed
 }
 
 func (s *ItemApplicationService) enrich(ctx context.Context, userID int, items []models.Item) error {

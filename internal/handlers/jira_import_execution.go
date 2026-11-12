@@ -504,7 +504,7 @@ func (h *JiraImportHandler) prepareJiraGlobalModel(
 	}
 	model.itemTypeMap = itemTypeMap
 
-	h.importJiraAssets(ctx, jobID, client, createdByUserID)
+	h.importJiraAssets(ctx, jobID, client, createdByUserID, req.AssetSchemaIDs)
 	if h.failOnMappingFailure(jobID, progress) {
 		return model, true
 	}
@@ -542,6 +542,19 @@ func (h *JiraImportHandler) prepareJiraGlobalModel(
 		slog.Error("Failed to ensure Affects Version custom field", slog.String("component", "jira"), slog.Any("error", err))
 	}
 	model.affectsVersionField = affectsVersionField
+
+	// Resolve service-desk customer identities once across every selected
+	// project. Data Center group membership spans projects, so a customer
+	// referenced while importing a non-service-desk project must still be
+	// classified as a customer rather than an internal user (WI-2075).
+	customerIdentities := map[string]struct{}{}
+	for _, projectKey := range req.ProjectKeys {
+		for identity := range resolveJiraServiceDeskCustomerIdentities(ctx, projectKey, client) {
+			customerIdentities[identity] = struct{}{}
+		}
+	}
+	model.customerIdentities = customerIdentities
+
 	if h.failOnMappingFailure(jobID, progress) {
 		return model, true
 	}
@@ -603,6 +616,7 @@ func (h *JiraImportHandler) setupJiraProject(
 		userMap:             make(map[string]int),
 		usernameMap:         make(map[string]string),
 		portalCustomerMap:   make(map[string]int),
+		customerIdentities:  global.customerIdentities,
 	}
 
 	jsmImport, err := h.prepareJiraServiceManagementImport(
@@ -621,6 +635,10 @@ func (h *JiraImportHandler) setupJiraProject(
 	if h.failOnMappingFailure(jobID, progress) {
 		return nil, false
 	}
+
+	// Import Jira groups and project roles so workflow guards that reference
+	// them resolve to real Windshift principals before workflows are built.
+	h.importJiraGroupsAndRoles(ctx, im, projectKey)
 
 	// Create workflows and configuration set for this project
 	if err := h.ensureWorkflowsAndConfigSet(ctx, jobID, projectKey, workspaceID, global.statusMap, global.itemTypeMap, client); err != nil {
@@ -668,7 +686,7 @@ func (h *JiraImportHandler) setupJiraProject(
 	}
 	im.iterationMap = iterationMap
 
-	h.importJiraBoardsAndFilters(ctx, jobID, projectKey, workspaceID, global.statusMap, client, createdByUserID)
+	h.importJiraBoardsAndFilters(ctx, jobID, projectKey, workspaceID, jiraWorkspaceProjectKeys(req.Mappings.Workspaces, projectKey, workspaceID), global.statusMap, client, createdByUserID)
 
 	timeProjectID, err := h.ensureJiraTimeProject(jobID, workspaceID, projectKey, wsMapping.NewWorkspaceName)
 	if err != nil {
@@ -912,21 +930,23 @@ func (h *JiraImportHandler) ensureJiraBatchUsers(ctx context.Context, im *jiraIm
 	}
 	internalUsers := usersToProcess
 	var portalCustomers []JiraUserSummary
-	if im.jsmImport != nil {
-		internalUsers, portalCustomers = splitJiraImportUsers(usersToProcess)
+	if len(im.customerIdentities) > 0 {
+		internalUsers, portalCustomers = splitJiraImportUsers(usersToProcess, im.customerIdentities)
 	}
-	newUserMappings, newUsernameMappings, err := h.ensureUsers(ctx, im.jobID, internalUsers, im.client)
-	if err != nil {
-		slog.Error("Failed to ensure users", slog.String("component", "jira"), slog.Any("error", err))
+	if len(internalUsers) > 0 {
+		newUserMappings, newUsernameMappings, err := h.ensureUsers(ctx, im.jobID, internalUsers, im.client)
+		if err != nil {
+			slog.Error("Failed to ensure users", slog.String("component", "jira"), slog.Any("error", err))
+		}
+		// Merge new mappings into userMap and usernameMap
+		for k, v := range newUserMappings {
+			im.userMap[k] = v
+		}
+		for k, v := range newUsernameMappings {
+			im.usernameMap[k] = v
+		}
 	}
-	// Merge new mappings into userMap and usernameMap
-	for k, v := range newUserMappings {
-		im.userMap[k] = v
-	}
-	for k, v := range newUsernameMappings {
-		im.usernameMap[k] = v
-	}
-	if len(portalCustomers) > 0 {
+	if len(portalCustomers) > 0 && im.jsmImport != nil {
 		newPortalMappings, portalErr := h.ensurePortalCustomers(
 			im.jobID, im.jsmImport.ChannelID, portalCustomers, im.jsmImport.CustomerOrganizations,
 		)
@@ -1755,6 +1775,7 @@ type jiraImportWorkflowEdge struct {
 	fromStatusID *int
 	toStatusID   int
 	reviewLocked bool
+	guards       []jiraimport.WorkflowGuard
 }
 
 // ensureWorkflowsAndConfigSet fetches Jira's configured graph when the client
@@ -1847,6 +1868,7 @@ func (h *JiraImportHandler) ensureWorkflowsAndConfigSet(
 	}
 
 	definitions := make([]jiraimport.WorkflowDefinition, 0, len(groups))
+	principals := h.loadJiraGuardPrincipals()
 	for groupIndex := range groups {
 		group := &groups[groupIndex]
 		workflowName := group.name
@@ -1855,7 +1877,7 @@ func (h *JiraImportHandler) ensureWorkflowsAndConfigSet(
 		}
 		var edges []jiraImportWorkflowEdge
 		if group.authoritative {
-			edges = authoritativeJiraWorkflowEdges(group, statusMap)
+			edges = authoritativeJiraWorkflowEdges(group, statusMap, principals)
 		} else {
 			initialStatusID, initialErr := h.conservativeJiraInitialStatus(group.statusIDs)
 			if initialErr != nil {
@@ -1866,7 +1888,8 @@ func (h *JiraImportHandler) ensureWorkflowsAndConfigSet(
 		serviceEdges := make([]jiraimport.WorkflowEdge, 0, len(edges))
 		for _, edge := range edges {
 			serviceEdges = append(serviceEdges, jiraimport.WorkflowEdge{
-				FromStatusID: edge.fromStatusID, ToStatusID: edge.toStatusID, ReviewLocked: edge.reviewLocked,
+				FromStatusID: edge.fromStatusID, ToStatusID: edge.toStatusID,
+				ReviewLocked: edge.reviewLocked, Guards: edge.guards,
 			})
 		}
 		fidelity := "authoritative_graph"
@@ -1877,17 +1900,21 @@ func (h *JiraImportHandler) ensureWorkflowsAndConfigSet(
 		if sourceID == "" {
 			sourceID = fmt.Sprintf("fallback-%s-%d", projectKey, groupIndex)
 		}
+		metadata := map[string]any{
+			"fidelity": fidelity, "transition_count": len(edges),
+			"transition_rules_complete":       group.rulesComplete,
+			"guarded_transition_count":        group.guardedTransitions,
+			"review_locked_transition_count":  countReviewLockedJiraEdges(edges),
+			"unsupported_transition_actions":  group.unsupportedActions,
+			"unsupported_transition_triggers": group.unsupportedTriggers,
+		}
+		for key, value := range jiraGuardMetadata(serviceEdges) {
+			metadata[key] = value
+		}
 		definitions = append(definitions, jiraimport.WorkflowDefinition{
 			SourceID: sourceID, Name: workflowName, Description: group.description,
 			Edges: serviceEdges, ItemTypeIDs: group.itemTypeIDs,
-			Metadata: map[string]any{
-				"fidelity": fidelity, "transition_count": len(edges),
-				"transition_rules_complete":       group.rulesComplete,
-				"guarded_transition_count":        group.guardedTransitions,
-				"review_locked_transition_count":  countReviewLockedJiraEdges(edges),
-				"unsupported_transition_actions":  group.unsupportedActions,
-				"unsupported_transition_triggers": group.unsupportedTriggers,
-			},
+			Metadata: metadata,
 		})
 	}
 	configSetID, err := h.imports.CreateDetailedWorkflowConfiguration(ctx, jobID, projectKey, workspaceID, definitions)
@@ -2017,9 +2044,11 @@ func fallbackJiraWorkflowGroups(
 func authoritativeJiraWorkflowEdges(
 	group *jiraImportWorkflowGroup,
 	statusMap map[string]int,
+	principals jiraGuardPrincipals,
 ) []jiraImportWorkflowEdge {
 	edgesByKey := make(map[string]jiraImportWorkflowEdge)
-	addEdge := func(fromStatusID *int, toStatusID int, reviewLocked bool) {
+	seenGuards := make(map[string]map[string]bool)
+	addEdge := func(fromStatusID *int, toStatusID int, reviewLocked bool, guards []jiraimport.WorkflowGuard) {
 		key := "initial:" + strconv.Itoa(toStatusID)
 		if fromStatusID != nil {
 			// A same-status (loop) transition is valid in Windshift, so import it
@@ -2030,6 +2059,17 @@ func authoritativeJiraWorkflowEdges(
 		edge.fromStatusID = fromStatusID
 		edge.toStatusID = toStatusID
 		edge.reviewLocked = edge.reviewLocked || reviewLocked
+		if seenGuards[key] == nil {
+			seenGuards[key] = map[string]bool{}
+		}
+		for _, guard := range guards {
+			dedupe := guard.Kind + "|" + guard.Mode + "|" + guard.ConditionType
+			if seenGuards[key][dedupe] {
+				continue
+			}
+			seenGuards[key][dedupe] = true
+			edge.guards = append(edge.guards, guard)
+		}
 		edgesByKey[key] = edge
 	}
 
@@ -2043,24 +2083,27 @@ func authoritativeJiraWorkflowEdges(
 		// Do not turn incomplete source visibility into a synthetic deny rule.
 		// Only a guard that Jira explicitly reports should require review.
 		reviewLocked := explicitlyGuarded
+		guards := mapJiraWorkflowGuards(transition.Guards, principals)
 		toStatusID, ok := statusMap[transition.ToStatusID]
 		if !ok {
 			continue
 		}
 		switch transition.Type {
 		case jira.JiraWorkflowTransitionInitial:
-			addEdge(nil, toStatusID, false)
+			// The initial transition is never review-locked; that would block
+			// creating items.
+			addEdge(nil, toStatusID, false, nil)
 		case jira.JiraWorkflowTransitionDirected:
 			for _, jiraFromStatusID := range transition.FromStatusIDs {
 				if fromStatusID, exists := statusMap[jiraFromStatusID]; exists {
 					fromID := fromStatusID
-					addEdge(&fromID, toStatusID, reviewLocked)
+					addEdge(&fromID, toStatusID, reviewLocked, guards)
 				}
 			}
 		case jira.JiraWorkflowTransitionGlobal:
 			for _, fromStatusID := range group.statusIDs {
 				fromID := fromStatusID
-				addEdge(&fromID, toStatusID, reviewLocked)
+				addEdge(&fromID, toStatusID, reviewLocked, guards)
 			}
 		}
 	}
