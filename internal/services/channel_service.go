@@ -27,6 +27,7 @@ var (
 		"form":    true,
 		"widget":  true,
 		"imap":    true,
+		"graph":   true,
 	}
 	ValidChannelDirections = map[string]bool{
 		"inbound":  true,
@@ -50,6 +51,7 @@ var requiredChannelDirection = map[string]string{
 	"form":    "inbound",
 	"imap":    "inbound",
 	"widget":  "inbound",
+	"graph":   "outbound",
 }
 
 // ErrInvalidChannelField is returned by Create/Update when a caller supplies
@@ -394,6 +396,14 @@ func (s *ChannelService) IsPluginManaged(ctx context.Context, id int) (bool, err
 // GetConfig retrieves the raw config for a channel (for internal use)
 func (s *ChannelService) GetConfig(ctx context.Context, id int) (string, error) {
 	return s.repo.GetConfig(ctx, id)
+}
+
+// PromoteDefaultOutbound makes this outbound SMTP or Graph channel the
+// notification default and demotes every other outbound mail channel.
+func (s *ChannelService) PromoteDefaultOutbound(ctx context.Context, id int) error {
+	return database.WithTx(s.db, func(tx database.Tx) error {
+		return s.repo.PromoteDefaultOutbound(ctx, tx, id)
+	})
 }
 
 // Channel Manager methods

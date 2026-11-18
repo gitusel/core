@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -475,6 +476,16 @@ func (es *EmailScheduler) pollIntake(
 			"channel_id", ch.ID, "intake_id", intake.ID, "mailbox", mailbox, "error", err)
 		return err
 	}
+	if store, ok := client.(email.GraphDeltaStore); ok {
+		store.RestoreGraphDelta(state.GraphDeltaLink)
+	}
+	if reset, ok := client.(email.GraphCursorControl); ok && reset.GraphFolderMismatch() {
+		// The intake folder changed and the repository still holds the previous
+		// folder's delta link. Resume would keep polling the old folder.
+		state.UIDValidity = 0
+		state.LastUID = 0
+		state.GraphDeltaLink = ""
+	}
 	currentValidity := selectData.UIDValidity
 	sinceUID := uint32(state.LastUID) //nolint:gosec // bounded by IMAP UID constraints
 	if state.UIDValidity != 0 && state.UIDValidity != currentValidity {
@@ -499,6 +510,28 @@ func (es *EmailScheduler) pollIntake(
 	es.mu.RLock()
 	batchSize := es.batchSize
 	es.mu.RUnlock()
+	if skipExisting {
+		if primer, ok := client.(email.GraphBaselineSync); ok {
+			done, primeErr := primer.EstablishBaseline(ctx, batchSize)
+			if primeErr != nil {
+				slog.Error("failed to establish graph delta baseline",
+					"channel_id", ch.ID, "intake_id", intake.ID, "error", primeErr)
+				return primeErr
+			}
+			// The final deltaLink and the initialized validity must land
+			// together. Saving the link first and crashing before validity
+			// leaves the next tick in baseline mode, which would discard mail
+			// that arrived after that link.
+			if err := es.commitGraphBaseline(ctx, ch, intake, client, done, currentValidity); err != nil {
+				slog.Error("failed to store graph baseline", "channel_id", ch.ID, "intake_id", intake.ID, "error", err)
+				return err
+			}
+			return nil
+		}
+	}
+	if ctrl, ok := client.(email.GraphCursorControl); ok {
+		ctrl.OmitExhaustedPoison(maxDeliveryAttempts)
+	}
 	messages, err := client.FetchMessages(sinceUID, batchSize)
 	if err != nil {
 		slog.Error("failed to fetch messages", "channel_id", ch.ID, "intake_id", intake.ID, "error", err)
@@ -510,6 +543,7 @@ func (es *EmailScheduler) pollIntake(
 		} else {
 			es.updatePollLastChecked(ctx, ch, intake, currentValidity)
 		}
+		es.commitGraphDelta(ctx, ch, intake, client)
 		return nil
 	}
 
@@ -522,20 +556,31 @@ func (es *EmailScheduler) pollIntake(
 	var lastBatchError string
 	var offenderUID uint32
 	deferredClaim := false
+	stoppedEarly := false
 	disposition := email.ResolveEmailDisposition(&effective)
 	for _, msg := range messages {
 		if ctx.Err() != nil {
 			// The per-mailbox budget expired between messages. Stop cleanly so
 			// the watermark covers everything already processed instead of
 			// recording a processing error for mail we never started.
+			stoppedEarly = true
 			break
 		}
 		if msg.FetchError != nil {
+			if id, _, exhausted := noteGraphPoison(client, msg.UID); exhausted {
+				slog.Error("dropping poison graph message after repeated fetch failures; continuing so later mail on this delta page is not skipped",
+					"channel_id", ch.ID, "intake_id", intake.ID, "uid", msg.UID, "graph_id", id, "error", msg.FetchError)
+				state.FailedMessageUID = 0
+				state.FailedMessageUIDValidity = 0
+				state.FailedMessageCount = 0
+				continue
+			}
 			slog.Error("failed to fetch bounded email body, stopping batch to avoid skipping the UID",
 				"channel_id", ch.ID, "intake_id", intake.ID, "uid", msg.UID, "error", msg.FetchError)
 			errorCount++
 			offenderUID = msg.UID
 			lastBatchError = fmt.Sprintf("fetch UID %d: %s", msg.UID, msg.FetchError.Error())
+			stoppedEarly = true
 			break
 		}
 		parsed := es.parser.Parse(msg)
@@ -547,8 +592,18 @@ func (es *EmailScheduler) pollIntake(
 			if ctx.Err() != nil {
 				// The budget expired inside the message. Leave the cursor before
 				// it so the next tick retries; do not count it as a poison email.
+				stoppedEarly = true
 				break
 			}
+			if id, _, exhausted := noteGraphPoison(client, msg.UID); exhausted {
+				slog.Error("dropping poison graph message after repeated failures; continuing so later mail on this delta page is not skipped",
+					"channel_id", ch.ID, "intake_id", intake.ID, "uid", msg.UID, "graph_id", id, "error", processErr)
+				state.FailedMessageUID = 0
+				state.FailedMessageUIDValidity = 0
+				state.FailedMessageCount = 0
+				continue
+			}
+			stoppedEarly = true
 			slog.Error("failed to process email, stopping batch to avoid skipping the UID",
 				"channel_id", ch.ID, "intake_id", intake.ID, "uid", msg.UID,
 				"message_id", parsed.MessageID, "error", processErr)
@@ -561,6 +616,7 @@ func (es *EmailScheduler) pollIntake(
 			slog.Info("deferring email behind unfinished tracking claim",
 				"channel_id", ch.ID, "intake_id", intake.ID, "uid", msg.UID, "message_id", parsed.MessageID)
 			deferredClaim = true
+			stoppedEarly = true
 			break
 		}
 		slog.Info("processed email",
@@ -632,6 +688,16 @@ func (es *EmailScheduler) pollIntake(
 	}
 
 	es.updatePollState(ctx, ch, intake, int(maxUID), currentValidity, failedUID, failedValidity, failedCount)
+	if !stoppedEarly {
+		if ctrl, ok := client.(email.GraphCursorControl); ok {
+			ctrl.AcceptGraphPage()
+		}
+		es.commitGraphDelta(ctx, ch, intake, client)
+	} else if ctrl, ok := client.(email.GraphCursorControl); ok {
+		if _, _, poisoned := ctrl.Poison(); poisoned {
+			es.commitGraphDelta(ctx, ch, intake, client)
+		}
+	}
 
 	slog.Info("finished processing intake",
 		"channel_id", ch.ID,
@@ -645,6 +711,76 @@ func (es *EmailScheduler) pollIntake(
 		return fmt.Errorf("%s", lastBatchError)
 	}
 	return nil
+}
+
+// noteGraphPoison records a failed Graph message by its id. Synthetic UIDs
+// restart every poll, so they must not identify poison or missing-Message-ID
+// mail. exhausted means this id has failed enough times to skip while the
+// rest of the page is still processed.
+func noteGraphPoison(client email.IMAPClient, uid uint32) (id string, count int, exhausted bool) {
+	ctrl, ok := client.(email.GraphCursorControl)
+	if !ok {
+		return "", 0, false
+	}
+	id, ok = ctrl.GraphMessageID(uid)
+	if !ok || id == "" {
+		return "", 0, false
+	}
+	count = 1
+	if prev, n, ok := ctrl.Poison(); ok && prev == id {
+		count = n + 1
+	}
+	if count >= maxDeliveryAttempts {
+		return id, count, true
+	}
+	ctrl.SetGraphPoison(id, count)
+	return id, count, false
+}
+
+// commitGraphBaseline stores a baseline page. A finished round writes the
+// resume link and the initialized validity in one update. An unfinished round
+// writes only the nextLink so the next tick keeps priming.
+func (es *EmailScheduler) commitGraphBaseline(ctx context.Context, ch channelInfo, intake *models.Intake, client email.IMAPClient, done bool, uidValidity uint32) error {
+	store, ok := client.(email.GraphDeltaStore)
+	if !ok || intake == nil || intake.ID <= 0 {
+		return nil
+	}
+	link := strings.TrimSpace(store.GraphDelta())
+	if link == "" {
+		return fmt.Errorf("graph baseline did not produce a resume link")
+	}
+	persistCtx, cancel := detachedPersistenceContext(ctx)
+	defer cancel()
+	var err error
+	if done {
+		_, err = es.db.ExecWriteContext(persistCtx, `
+			UPDATE email_intake_state
+			SET graph_delta_link = ?, uid_validity = ?, last_uid = 0,
+			    failed_message_uid = 0, failed_message_uid_validity = 0,
+			    failed_message_count = 0, updated_at = CURRENT_TIMESTAMP
+			WHERE intake_id = ?
+		`, link, uidValidity, intake.ID)
+	} else {
+		_, err = es.db.ExecWriteContext(persistCtx, `
+			UPDATE email_intake_state
+			SET graph_delta_link = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE intake_id = ?
+		`, link, intake.ID)
+	}
+	if err != nil {
+		return fmt.Errorf("store graph baseline: %w", err)
+	}
+	return nil
+}
+
+// graphPoisonExhausted remains for IMAP-shaped tests of the attempt counter.
+// Graph poison uses noteGraphPoison and the checkpoint Graph id.
+func graphPoisonExhausted(graph bool, state *models.EmailIntakeState, uid, uidValidity uint32) bool {
+	if !graph || state == nil {
+		return false
+	}
+	_, _, count := nextFailedMessageAttempt(state.FailedMessageUID, state.FailedMessageUIDValidity, state.FailedMessageCount, uid, uidValidity)
+	return count >= maxDeliveryAttempts
 }
 
 // nextFailedMessageAttempt advances the poison counter only when the same UID
@@ -664,10 +800,12 @@ func (es *EmailScheduler) getOrCreateIntakeState(ctx context.Context, intakeID i
 		var state models.EmailIntakeState
 		err := es.db.QueryRowContext(ctx, `
 			SELECT intake_id, last_uid, uid_validity,
-			       failed_message_uid, failed_message_uid_validity, failed_message_count
+			       failed_message_uid, failed_message_uid_validity, failed_message_count,
+			       COALESCE(graph_delta_link, '')
 			FROM email_intake_state WHERE intake_id = ?
 		`, intakeID).Scan(&state.IntakeID, &state.LastUID, &state.UIDValidity,
-			&state.FailedMessageUID, &state.FailedMessageUIDValidity, &state.FailedMessageCount)
+			&state.FailedMessageUID, &state.FailedMessageUIDValidity, &state.FailedMessageCount,
+			&state.GraphDeltaLink)
 		if err != nil {
 			return nil, err
 		}
@@ -690,6 +828,28 @@ func (es *EmailScheduler) getOrCreateIntakeState(ctx context.Context, intakeID i
 	}
 	// Re-read so a row created by a concurrent caller is not reported as zero.
 	return read()
+}
+
+// commitGraphDelta stores the resume link only after the caller has decided
+// every fetched message reached a durable outcome. A failed or deferred tick
+// leaves the previous link in place so the next poll retries it. An empty
+// link is not written: that would wipe a saved cursor and re-read the folder.
+func (es *EmailScheduler) commitGraphDelta(ctx context.Context, ch channelInfo, intake *models.Intake, client email.IMAPClient) {
+	store, ok := client.(email.GraphDeltaStore)
+	if !ok || intake.ID <= 0 {
+		return
+	}
+	link := strings.TrimSpace(store.GraphDelta())
+	if link == "" {
+		return
+	}
+	persistCtx, cancel := detachedPersistenceContext(ctx)
+	defer cancel()
+	if _, err := es.db.ExecWriteContext(persistCtx, `
+		UPDATE email_intake_state SET graph_delta_link = ?, updated_at = CURRENT_TIMESTAMP WHERE intake_id = ?
+	`, link, intake.ID); err != nil {
+		slog.Error("failed to store graph delta link", "channel_id", ch.ID, "intake_id", intake.ID, "error", err)
+	}
 }
 
 // updateIntakeState persists the per-folder cursor and poison tracker.

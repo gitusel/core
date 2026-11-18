@@ -8,6 +8,7 @@
   import Globe from '@lucide/svelte/icons/globe';
   import Mail from '@lucide/svelte/icons/mail';
   import Send from '@lucide/svelte/icons/send';
+  import MailForward from '@tabler/icons-svelte-runes/icons/mail-forward';
   import ClipboardList from '@lucide/svelte/icons/clipboard-list';
   import TabStrip from '../components/TabStrip.svelte';
   import { channels } from '../api/channels.js';
@@ -28,6 +29,7 @@
   import ChannelWebhookConfig from '../features/channels/ChannelWebhookConfig.svelte';
   import ChannelEmailConfig from '../features/channels/ChannelEmailConfig.svelte';
   import ChannelSMTPConfig from '../features/channels/ChannelSMTPConfig.svelte';
+  import ChannelGraphConfig from '../features/channels/ChannelGraphConfig.svelte';
   import ChannelFormConfig from '../features/channels/ChannelFormConfig.svelte';
   import FormBuilder from '../features/channels/FormBuilder.svelte';
   import { channelBasicFormData, loadPortalConnectedMailboxes, portalChannelFormData, tryParseChannelConfig } from '../features/channels/channelAdmin.js';
@@ -35,6 +37,8 @@
 	import TextareaField from '../components/TextareaField.svelte';
 	import SelectField from '../components/SelectField.svelte';
 	import TextField from '../components/TextField.svelte';
+	import DescriptionText from '../components/DescriptionText.svelte';
+	import Toggle from '../components/Toggle.svelte';
 
   let {
     isOpen = false,
@@ -54,6 +58,8 @@
   let emailConfigRef = $state(null);
   let smtpConfigRef = $state(null);
   let formConfigRef = $state(null);
+  let graphConfigRef = $state(null);
+  let useAsDefault = $state(false);
 
   // Inbound portal channels for the email channel's connected-portal select,
   // and email channels linked to a portal channel (read-only list).
@@ -132,6 +138,16 @@
     enabled: false
   });
 
+  let graphFormData = $state({
+    tenant_id: '',
+    client_id: '',
+    client_secret: '',
+    secret_stored: false,
+    from_email: '',
+    from_name: '',
+    enabled: false
+  });
+
   // Form channel configuration form data
   let formChannelFormData = $state({
     slug: '',
@@ -174,6 +190,7 @@
   $effect(() => {
     if (channel && isOpen) {
       persistedStatus = channel.status || 'disabled';
+      useAsDefault = channel.is_default === true;
       portalOptions = [];
       connectedMailboxes = [];
       channelFormData = channelBasicFormData(channel);
@@ -258,6 +275,16 @@
           auth_method: config.smtp_auth_method || 'auto',
           enabled: channel.status === 'enabled'
         };
+      } else if (channel.type === 'graph') {
+        graphFormData = {
+          tenant_id: config.graph_tenant_id || '',
+          client_id: config.graph_client_id || '',
+          client_secret: '',
+          secret_stored: channel.has_graph_client_secret === true,
+          from_email: config.graph_from_email || '',
+          from_name: config.graph_from_name || '',
+          enabled: channel.status === 'enabled'
+        };
       } else if (channel.type === 'form') {
         formChannelFormData = {
           slug: config.form_slug || '',
@@ -314,6 +341,7 @@
     if (channel.type === 'email') return emailFormData.enabled;
     if (channel.type === 'webhook') return webhookFormData.enabled;
     if (channel.type === 'smtp') return smtpFormData.enabled;
+    if (channel.type === 'graph') return graphFormData.enabled;
     return null;
   }
 
@@ -376,7 +404,8 @@
       'webhook': Webhook,
       'portal': Globe,
       'email': Mail,
-      'smtp': Send
+      'smtp': Send,
+      'graph': MailForward
     };
     return icons[type] || LifeBuoy;
   }
@@ -401,6 +430,10 @@
 
     if (channel.type === 'smtp' && smtpConfigRef) {
       return smtpConfigRef.validate();
+    }
+
+    if (channel.type === 'graph' && graphConfigRef) {
+      return graphConfigRef.validate();
     }
 
     if (channel.type === 'form' && formConfigRef) {
@@ -437,7 +470,7 @@
           id: channel.id,
           type: channel.type,
           direction: channel.direction,
-          is_default: channel.is_default,
+          is_default: useAsDefault,
           name: channelFormData.name,
           description: channelFormData.description,
           category_id: channelFormData.category_id
@@ -455,6 +488,9 @@
         } else if (channel.type === 'smtp' && smtpConfigRef) {
           await channels.updateConfig(channel.id, smtpConfigRef.getConfig());
           smtpConfigRef.clearSecret?.();
+        } else if (channel.type === 'graph' && graphConfigRef) {
+          await channels.updateConfig(channel.id, graphConfigRef.getConfig());
+          graphConfigRef.clearSecret?.();
         } else if (channel.type === 'form' && formConfigRef) {
           await channels.updateConfig(channel.id, formConfigRef.getConfig());
         }
@@ -595,6 +631,15 @@
                   bind:value={channelFormData.description}
                 />
               </div>
+              {#if (channel.type === 'smtp' || channel.type === 'graph') && $isSystemAdmin && !isPluginOwned(channel)}
+                <div class="flex items-start justify-between gap-4 pt-2">
+                  <div>
+                    <div class="text-sm font-medium" style="color: var(--ds-text);">{t('channel.useAsDefaultNotification')}</div>
+                    <DescriptionText>{t('channel.defaultNotificationHelp')}</DescriptionText>
+                  </div>
+                  <Toggle bind:checked={useAsDefault} disabled={channel.is_default} dataTestid="channel-default-outbound" />
+                </div>
+              {/if}
             </div>
           </div>
 
@@ -631,6 +676,13 @@
               bind:this={smtpConfigRef}
               channelId={channel.id}
               bind:formData={smtpFormData}
+              onSave={onSave}
+            />
+          {:else if channel.type === 'graph'}
+            <ChannelGraphConfig
+              bind:this={graphConfigRef}
+              channelId={channel.id}
+              bind:formData={graphFormData}
               onSave={onSave}
             />
           {:else if channel.type === 'form'}

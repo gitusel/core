@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"windshift/internal/email"
+	"windshift/internal/graph"
 	"windshift/internal/logger"
 	"windshift/internal/models"
+	"windshift/internal/outbound"
 	"windshift/internal/repository"
 	"windshift/internal/restapi"
 	"windshift/internal/sanitize"
@@ -423,7 +425,8 @@ func (h *ChannelHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	if _, ok := h.requireChannelManageAccess(ctx, w, r, id); !ok {
+	user, ok := h.requireChannelManageAccess(ctx, w, r, id)
+	if !ok {
 		return
 	}
 
@@ -447,10 +450,30 @@ func (h *ChannelHandler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default status changes go through the dedicated atomic workflow.
+	// Promoting the notification default is a separate atomic write. Demotion
+	// is not offered here: another outbound mail channel has to take the role.
 	if updates.IsDefault != existing.IsDefault {
-		respondValidationError(w, r, "Default-channel status cannot be changed through the metadata endpoint")
-		return
+		if !updates.IsDefault || existing.Direction != "outbound" || (existing.Type != "smtp" && existing.Type != "graph") {
+			respondValidationError(w, r, "Promote another outbound mail channel to replace the default")
+			return
+		}
+		admin, adminErr := h.service.UserIsSystemAdmin(user.ID)
+		if adminErr != nil {
+			respondInternalError(w, r, adminErr)
+			return
+		}
+		if !admin {
+			respondForbidden(w, r)
+			return
+		}
+		if err = h.service.PromoteDefaultOutbound(ctx, id); err != nil {
+			if errors.Is(err, repository.ErrInvalidInput) {
+				respondValidationError(w, r, err.Error())
+				return
+			}
+			respondInternalError(w, r, err)
+			return
+		}
 	}
 	if updates.CategoryID != nil {
 		exists, categoryErr := h.channelRepo.CategoryExists(ctx, *updates.CategoryID)
@@ -744,6 +767,13 @@ func (h *ChannelHandler) TestChannel(w http.ResponseWriter, r *http.Request) {
 		if success {
 			h.updateChannelActivity(ctx, channel.ID)
 		}
+	case "graph":
+		success, message := h.testGraphChannelWithEmail(ctx, channel, testRequest.TestEmail)
+		result["success"] = success
+		result["message"] = message
+		if success {
+			h.updateChannelActivity(ctx, channel.ID)
+		}
 	default:
 		result["success"] = false
 		result["message"] = fmt.Sprintf("Testing not implemented for channel type: %s", channel.Type)
@@ -827,6 +857,20 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 		}
 		testData.Config.WebhookSecret = secret
 	}
+	if channelType == "graph" && strings.TrimSpace(testData.Config.GraphClientSecret) == "" {
+		rawConfig, configErr := h.service.GetConfig(ctx, id)
+		if configErr != nil {
+			respondInternalError(w, r, configErr)
+			return
+		}
+		var stored models.ChannelConfig
+		if configErr = json.Unmarshal([]byte(rawConfig), &stored); configErr != nil {
+			respondInternalError(w, r, configErr)
+			return
+		}
+		// A blank secret means keep the stored ciphertext. testGraphConfig decrypts it.
+		testData.Config.GraphClientSecret = stored.GraphClientSecret
+	}
 
 	result := make(map[string]any)
 	result["channel_id"] = id
@@ -839,6 +883,14 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 			result["message"] = "SMTP connection successful"
 		} else {
 			result["message"] = "SMTP connection failed"
+		}
+	case "graph":
+		if err := h.testGraphConfig(ctx, testData.Config); err != nil {
+			result["success"] = false
+			result["message"] = err.Error()
+		} else {
+			result["success"] = true
+			result["message"] = "Graph credentials accepted"
 		}
 	case "webhook":
 		if h.webhookSender != nil {
@@ -855,6 +907,37 @@ func (h *ChannelHandler) TestChannelConfig(w http.ResponseWriter, r *http.Reques
 	}
 
 	respondJSONOK(w, result)
+}
+
+// testGraphConfig checks Graph app credentials by acquiring a token.
+func (h *ChannelHandler) testGraphConfig(ctx context.Context, cfg models.ChannelConfig) error {
+	secret, err := email.DecryptOrLegacy(h.encryption, cfg.GraphClientSecret)
+	if err != nil {
+		return fmt.Errorf("graph client secret: %w", err)
+	}
+	return graph.CheckCredentials(ctx, graph.Config{
+		TenantID:     cfg.GraphTenantID,
+		ClientID:     cfg.GraphClientID,
+		ClientSecret: secret,
+	})
+}
+
+// testGraphChannelWithEmail sends a test message through Microsoft Graph.
+func (h *ChannelHandler) testGraphChannelWithEmail(ctx context.Context, channel models.Channel, testEmail string) (bool, string) {
+	var config models.ChannelConfig
+	if err := json.Unmarshal([]byte(channel.Config), &config); err != nil {
+		return false, "Failed to parse Graph configuration: " + err.Error()
+	}
+	if strings.TrimSpace(config.GraphFromEmail) == "" {
+		return false, "Graph from email is not configured"
+	}
+	subject := "Windshift Graph Test Email"
+	htmlBody := "<p>Windshift Graph test for " + html.EscapeString(channel.Name) + "</p>"
+	textBody := "Windshift Graph test for " + channel.Name
+	if err := graph.SendTestMail(ctx, h.channelRepo.DB(), h.encryption, config, testEmail, subject, htmlBody, textBody); err != nil {
+		return false, "Failed to send test email: " + err.Error()
+	}
+	return true, "Test email sent successfully to " + testEmail
 }
 
 // testSMTPChannelWithEmail tests an SMTP channel by sending a test email
@@ -1723,11 +1806,11 @@ func (h *ChannelHandler) RetryEmailReply(w http.ResponseWriter, r *http.Request)
 			Message:    "Reply is being delivered right now; retry once the queue shows its final state",
 		})
 		return
-	case errors.Is(err, services.ErrSMTPNotConfigured):
+	case errors.Is(err, outbound.ErrNotConfigured):
 		respondError(w, r, &restapi.APIError{
 			StatusCode: http.StatusConflict,
 			Code:       "SMTP_NOT_CONFIGURED",
-			Message:    "Outbound SMTP is not configured; configure it first or discard the reply",
+			Message:    "Outbound email is not configured; configure an outbound mail channel first or discard the reply",
 		})
 		return
 	case err != nil:
@@ -2083,12 +2166,12 @@ func (h *ChannelHandler) GetEmailLog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Default OAuth scopes for email providers. The monitored mailbox address is
-// entered by the admin (EmailOAuthMailbox), so no identity/userinfo scopes are
-// requested and no separate Graph/Google resource token is needed.
+// Default OAuth scopes for email providers. Microsoft receives mail with a
+// delegated Graph token (Mail.ReadWrite). Google still uses IMAP XOAUTH2.
+// The monitored mailbox is entered by the admin, so no identity scopes are requested.
 var defaultEmailOAuthScopes = map[string][]string{
 	"microsoft": {
-		"https://outlook.office365.com/IMAP.AccessAsUser.All",
+		"https://graph.microsoft.com/Mail.ReadWrite",
 		"offline_access",
 	},
 	"google": {
@@ -2162,9 +2245,9 @@ func (h *ChannelHandler) StartChannelEmailOAuth(w http.ResponseWriter, r *http.R
 		respondValidationError(w, r, "OAuth client secret not configured")
 		return
 	}
-	// The monitored mailbox is entered by the admin and is what IMAP XOAUTH2
-	// authenticates as. Require it before starting so the callback never has to
-	// guess an identity from the token.
+	// The monitored mailbox is entered by the admin. Microsoft Graph opens this
+	// mailbox; Google IMAP XOAUTH2 authenticates as it. Require it before
+	// starting so the callback never has to guess an identity from the token.
 	if _, ok := bareEmailAddress(config.EmailOAuthMailbox); !ok {
 		respondValidationError(w, r, "Enter the mailbox address to connect before starting OAuth")
 		return

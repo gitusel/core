@@ -66,8 +66,8 @@ CREATE TABLE IF NOT EXISTS intakes (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_intakes_mailbox_folder ON intakes(mailbox_id, folder);
 CREATE INDEX IF NOT EXISTS idx_intakes_portal ON intakes(portal_channel_id);
 
--- Per-folder IMAP watermark. The mailbox connection is polled once, but each
--- intake keeps its own UIDVALIDITY/UID cursor so folders advance independently.
+-- Per-folder poll cursor. IMAP intakes keep UIDVALIDITY/UID. Graph intakes
+-- keep the @odata.deltaLink. Folders advance independently.
 CREATE TABLE IF NOT EXISTS email_intake_state (
 	intake_id INTEGER PRIMARY KEY,
 	last_uid INTEGER DEFAULT 0,
@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS email_intake_state (
 	failed_message_uid INTEGER NOT NULL DEFAULT 0,
 	failed_message_uid_validity INTEGER NOT NULL DEFAULT 0,
 	failed_message_count INTEGER NOT NULL DEFAULT 0,
+	graph_delta_link TEXT NOT NULL DEFAULT '',
 	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (intake_id) REFERENCES intakes(id) ON DELETE CASCADE

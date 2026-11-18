@@ -16,6 +16,7 @@ import (
 	"windshift/internal/emailutil"
 	"windshift/internal/i18n"
 	"windshift/internal/models"
+	"windshift/internal/outbound"
 )
 
 var (
@@ -106,7 +107,7 @@ func (s *InvitationService) SendInvitationEmail(user *models.User, token string)
 		return ErrRecipientIsAgent
 	}
 	if s.smtpSender == nil {
-		return ErrSMTPNotConfigured
+		return outbound.ErrNotConfigured
 	}
 	firstName := user.FirstName
 	if firstName == "" {

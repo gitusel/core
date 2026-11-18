@@ -13,6 +13,9 @@ func (s *ChannelService) checkChannelPolicy(kind, raw string) error {
 	if controls.Allowed(operatorcontrols.GenericMail) && controls.Allowed(operatorcontrols.MailTransport) {
 		return nil
 	}
+	if kind == "graph" {
+		return controls.Check(operatorcontrols.MailTransport)
+	}
 	if kind == "smtp" {
 		if err := controls.Check(operatorcontrols.MailTransport); err != nil {
 			return err

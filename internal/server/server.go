@@ -30,6 +30,7 @@ import (
 	"windshift/internal/email"
 	"windshift/internal/emailutil"
 	"windshift/internal/events"
+	"windshift/internal/graph"
 	"windshift/internal/handlers"
 	"windshift/internal/health"
 	"windshift/internal/integrations/docmost"
@@ -44,6 +45,7 @@ import (
 	"windshift/internal/models"
 	"windshift/internal/objecttranslation"
 	"windshift/internal/operatorcontrols"
+	"windshift/internal/outbound"
 	"windshift/internal/plugins"
 	"windshift/internal/portalwebauthn"
 	"windshift/internal/ratelimit"
@@ -540,13 +542,41 @@ func (s *Server) initialize() error {
 		notificationAssetPermissions,
 	)
 
+	// Outbound mail routes through a neutral dispatcher. Adapters close over
+	// outboundEnv because base URL and the encryptor are created later in
+	// this function; sends happen after both are set.
+	outboundEnv := &struct {
+		mu      sync.Mutex
+		baseURL string
+		enc     outbound.Encryptor
+	}{}
+	// One SMTP sender for the process. Its idle-session pool and circuit
+	// breaker live on the instance; a per-send factory would strand open
+	// connections and reset that state on every message. WithConfig binds
+	// the dispatcher-selected channel without replacing that instance.
 	smtpSender := smtp.NewNotificationSMTPSender(s.db)
-	s.notificationScheduler = scheduler.NewNotificationScheduler(s.db, smtpSender, cfg.Notification.BatchInterval, s.notificationService)
+	outboundRegistry := outbound.NewRegistry()
+	outboundRegistry.Register("smtp", func(cfg *models.ChannelConfig) (outbound.Sender, error) {
+		if cfg == nil {
+			return nil, fmt.Errorf("smtp channel config is required")
+		}
+		return smtpSender.WithConfig(cfg), nil
+	})
+	outboundRegistry.Register("graph", func(cfg *models.ChannelConfig) (outbound.Sender, error) {
+		if cfg == nil {
+			return nil, fmt.Errorf("graph channel config is required")
+		}
+		outboundEnv.mu.Lock()
+		baseURL, enc := outboundEnv.baseURL, outboundEnv.enc
+		outboundEnv.mu.Unlock()
+		return graph.NewSender(s.db, baseURL, enc, *cfg), nil
+	})
+	outboundDispatch := outbound.NewDispatch(s.db, "", outboundRegistry)
+
+	s.notificationScheduler = scheduler.NewNotificationScheduler(s.db, outboundDispatch, cfg.Notification.BatchInterval, s.notificationService)
 	if cfg.Notification.OutboxBatchSize > 0 {
 		s.notificationScheduler.SetOutboxBatchSize(cfg.Notification.OutboxBatchSize)
 	}
-	s.notificationScheduler.Start()
-	slog.Info("notification scheduler started")
 
 	s.dueDateReminderScheduler = scheduler.NewDueDateReminderScheduler(s.db, s.notificationService, scheduler.DueDateReminderSchedulerConfig{
 		TickInterval: cfg.Reminders.Interval,
@@ -556,9 +586,8 @@ func (s *Server) initialize() error {
 
 	// The outbound email pool drains the threaded-reply and @mention outboxes
 	// on a fast, bounded cadence, separate from the 5-minute digest batching.
-	s.outboundEmailScheduler = scheduler.NewOutboundEmailScheduler(s.db, smtpSender, cfg.Notification.OutboxInterval, cfg.Notification.OutboxBatchSize)
-	s.outboundEmailScheduler.Start()
-	slog.Info("outbound email scheduler started")
+	// It is started later, after base URL, encryption, and outboxes are set.
+	s.outboundEmailScheduler = scheduler.NewOutboundEmailScheduler(s.db, outboundDispatch, cfg.Notification.OutboxInterval, cfg.Notification.OutboxBatchSize)
 
 	// WorkflowService is constructed here (moved up from later in bootstrap) so the
 	// recurrence scheduler can resolve a workspace+item-type's initial status the
@@ -625,15 +654,19 @@ func (s *Server) initialize() error {
 	if baseURL == "" {
 		baseURL = fmt.Sprintf("http://localhost:%s%s", cfg.Port, cfg.ContextPath)
 	}
+	outboundEnv.mu.Lock()
+	outboundEnv.baseURL = baseURL
+	outboundEnv.mu.Unlock()
+	outboundDispatch.SetBaseURL(baseURL)
 	smtpSender.SetBaseURL(baseURL)
 
-	emailVerificationService := services.NewEmailVerificationService(s.db, smtpSender, baseURL)
+	emailVerificationService := services.NewEmailVerificationService(s.db, outboundDispatch, baseURL)
 
 	portalSessionManager := auth.NewPortalSessionManagerWithTrustPolicy(s.db, enableHTTPS, trustPolicy, cfg.Auth.SessionSecret, cfg.Auth.SessionIPBinding)
 
-	magicLinkService := services.NewMagicLinkService(s.db, smtpSender, baseURL)
+	magicLinkService := services.NewMagicLinkService(s.db, outboundDispatch, baseURL)
 
-	invitationService := services.NewInvitationService(s.db, smtpSender, baseURL)
+	invitationService := services.NewInvitationService(s.db, outboundDispatch, baseURL)
 
 	workspaceKeyCache := handlers.NewWorkspaceKeyCache(repository.NewWorkspaceRepository(s.db))
 	authorizationCacheInvalidator := services.NewAuthorizationCacheInvalidator(permService, workspaceKeyCache)
@@ -953,6 +986,10 @@ func (s *Server) initialize() error {
 	s.scmHTTPClients = scm.NewHTTPClientPool()
 	scmProviderHandler := handlers.NewSCMProviderHandler(s.db, cfg.Auth.SessionSecret, baseURL, s.scmHTTPClients)
 	s.secretEncryption = scmProviderHandler.GetEncryption()
+	outboundEnv.mu.Lock()
+	outboundEnv.enc = s.secretEncryption
+	outboundEnv.mu.Unlock()
+	smtpSender.SetEncryption(s.secretEncryption)
 	scmWorkspaceRepo := repository.NewSCMWorkspaceRepository(s.db)
 	scmWorkspaceHandler := handlers.NewSCMWorkspaceHandler(scmWorkspaceRepo, scmProviderHandler.GetEncryption(), scmProviderHandler, scm.NewCredentialResolver(s.db, scmProviderHandler.GetEncryption(), s.scmHTTPClients), permService, baseURL)
 	scmItemLinksHandler := handlers.NewSCMItemLinksHandler(s.db, scmProviderHandler.GetEncryption(), permService, baseURL, s.scmHTTPClients)
@@ -1224,7 +1261,7 @@ func (s *Server) initialize() error {
 	commentService.SetInactivityMarkClearer(repository.NewActionTriggerMarkRepository(s.db))
 
 	// Wire email reply service for bidirectional email threading
-	emailReplyService := services.NewEmailReplyService(s.db, smtpSender)
+	emailReplyService := services.NewEmailReplyService(s.db, outboundDispatch)
 	emailReplyService.SetBaseURL(baseURL)
 	if err := services.PrepareDurableEmailReplyEngine(context.Background(), s.eventEngine, emailReplyService); err != nil {
 		return fmt.Errorf("prepare durable email reply consumer: %w", err)
@@ -1238,7 +1275,7 @@ func (s *Server) initialize() error {
 	// constructed above, before this notifier existed.
 	mentionEmailService := services.NewMentionEmailService(
 		s.db,
-		smtpSender,
+		outboundDispatch,
 		s.notificationService,
 		services.NewNotificationAuthorizer(s.db, permService, nil),
 	)
@@ -1246,6 +1283,12 @@ func (s *Server) initialize() error {
 	mentionService.SetMentionEmailNotifier(mentionEmailService)
 	s.notificationScheduler.SetMentionEmailOutbox(mentionEmailService)
 	s.outboundEmailScheduler.SetMentionEmailOutbox(mentionEmailService)
+	// Digests and outbox drains must not run before the public URL and the
+	// secret decryptor are published, or they race those assignments.
+	s.notificationScheduler.Start()
+	s.outboundEmailScheduler.Start()
+	slog.Info("notification scheduler started")
+	slog.Info("outbound email scheduler started")
 
 	// External request participants (WI-1136): the reply service sends the
 	// customer-facing "you were added" notice.
@@ -1385,14 +1428,11 @@ func (s *Server) initialize() error {
 	channelHandler.SetEncryption(scmProviderHandler.GetEncryption())
 	channelHandler.SetBaseURL(baseURL)
 	channelHandler.SetKnowledgeBasePageValidator(repository.NewPageRepository(s.db).ValidateLivePageInWorkspace)
+	// Channel test emails still go through the concrete SMTP sender: that
+	// path sends an arbitrary posted config, not the default outbound channel
+	// the dispatcher selects. Graph tests use the graph package directly.
 	channelHandler.SetSMTPSender(smtpSender)
 	channelHandler.SetCredentialManager(emailCredManager)
-	// Wire at-rest decryption into the SMTP sender so dispatch can decrypt
-	// SMTPPassword before AUTH PLAIN. Done here (after scmProviderHandler is
-	// initialized) rather than at smtpSender construction time because the
-	// scheduler/notification wiring above can't depend on the encryption
-	// service yet.
-	smtpSender.SetEncryption(scmProviderHandler.GetEncryption())
 
 	// Webhook handler
 	webhookHandler := handlers.NewWebhookHandler(repository.NewChannelRepository(s.db), repository.NewItemRepository(s.db), webhookSender, permService, channelService, logger.NewAuditor(s.db))

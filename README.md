@@ -101,8 +101,19 @@ It ships as a single Go binary with the Svelte frontend built in, SQLite by defa
 **Integrations and API**
 
 - GitHub, GitLab, Gitea, and Forgejo source control with pull request linking.
-- Jira importer, email and webhook notifications, SMTP/IMAP, LDAP, and OIDC single sign-on.
+- Jira importer, email and webhook notifications, Microsoft Graph, SMTP/IMAP, LDAP, and OIDC single sign-on.
 - MCP server with OAuth, REST API v2, and a WASM plugin runtime.
+
+Microsoft 365 outbound email has its own **Microsoft Graph** channel. Grant the
+Entra application `Mail.Send` application permission with admin consent, restrict
+its mailbox access in Exchange, and configure the tenant ID, client ID, client
+secret, and From mailbox in Channels. Select it as the default outbound email
+channel to use it for notifications, transactional email, and threaded replies.
+
+Microsoft inbound mail uses delegated Graph `Mail.ReadWrite` and `offline_access`.
+Existing Microsoft mailbox connections must reconnect to consent to Graph; replace
+any saved IMAP-only custom scopes as well. Google and generic mailboxes retain
+their existing IMAP transport.
 
 **Internationalization**
 

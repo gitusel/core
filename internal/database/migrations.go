@@ -3997,7 +3997,7 @@ END $$;
 		CheckPostgres: pgColumnCheck("collections", "default_sort"),
 		SQLite:        "ALTER TABLE collections ADD COLUMN default_sort TEXT",
 		Postgres:      "ALTER TABLE collections ADD COLUMN IF NOT EXISTS default_sort TEXT",
-	}, {
+}, {
 		Version:       "20261212_jira_csv_people",
 		Name:          "Remember source-qualified identity decisions for Jira CSV imports",
 		CheckSQLite:   sqliteTableCheck("jira_csv_people"),
@@ -4018,6 +4018,16 @@ END $$;
 			ALTER INDEX idx_items_workspace_frac_index_active_new RENAME TO idx_items_workspace_frac_index_active;
 		`,
 	}}
+},
+	{
+		Version:       "20261117_intake_graph_delta",
+		Name:          "Persist the Graph delta link per email intake",
+		CheckSQLite:   sqliteColumnCheck("email_intake_state", "graph_delta_link"),
+		CheckPostgres: pgColumnCheck("email_intake_state", "graph_delta_link"),
+		SQLite:        `ALTER TABLE email_intake_state ADD COLUMN graph_delta_link TEXT NOT NULL DEFAULT ''`,
+		Postgres:      `ALTER TABLE email_intake_state ADD COLUMN IF NOT EXISTS graph_delta_link TEXT NOT NULL DEFAULT ''`,
+	},
+}c349cc3 (Independent-Microsoft-Graph-channel)
 
 const jiraCSVPeopleSQL = `CREATE TABLE IF NOT EXISTS jira_csv_people (
 	source_ref TEXT PRIMARY KEY,

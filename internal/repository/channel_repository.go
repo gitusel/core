@@ -1691,6 +1691,7 @@ func (r *ChannelRepository) ConsumeOAuthState(ctx context.Context, state string,
 // secret without ever revealing it.
 func ScrubChannelForResponse(channel *models.Channel) {
 	channel.HasEmailOAuthClientSecret = channelConfigHasSecret(channel.Config, "email_oauth_client_secret")
+	channel.HasGraphClientSecret = channelConfigHasSecret(channel.Config, "graph_client_secret")
 	channel.Config = ScrubChannelConfig(channel.Config)
 }
 
@@ -1727,6 +1728,7 @@ func ScrubChannelConfig(configJSON string) string {
 	delete(config, "imap_password")
 	delete(config, "webhook_secret")
 	delete(config, "email_oauth_client_secret")
+	delete(config, "graph_client_secret")
 	delete(config, "email_oauth_access_token")
 	delete(config, "email_oauth_refresh_token")
 
@@ -1736,4 +1738,46 @@ func ScrubChannelConfig(configJSON string) string {
 		return "{}"
 	}
 	return string(scrubbed)
+}
+
+// PromoteDefaultOutbound makes an outbound SMTP or Graph channel the
+// notification default and clears that flag on every other outbound mail
+// channel. The unique index only prevents two defaults of the same type, so
+// both types must be cleared together or the dispatcher can keep the previous
+// mail channel.
+func (r *ChannelRepository) PromoteDefaultOutbound(ctx context.Context, tx database.Tx, id int) error {
+	var channelType, direction string
+	var plugin sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT type, direction, plugin_name FROM channels WHERE id = ?`, id).Scan(&channelType, &direction, &plugin)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("load channel for default promotion: %w", err)
+	}
+	if plugin.Valid && plugin.String != "" {
+		return fmt.Errorf("cannot modify plugin-managed channel")
+	}
+	if direction != "outbound" || (channelType != "smtp" && channelType != "graph") {
+		return fmt.Errorf("%w: only an outbound SMTP or Graph channel can be the default notification channel", ErrInvalidInput)
+	}
+	now := time.Now()
+	if _, err = tx.ExecContext(ctx, `
+		UPDATE channels SET is_default = false, updated_at = ?
+		WHERE direction = 'outbound' AND type IN ('smtp', 'graph') AND id != ? AND COALESCE(is_default, false) = true
+	`, now, id); err != nil {
+		return fmt.Errorf("clear previous default outbound mail channel: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE channels SET is_default = true, updated_at = ?
+		WHERE id = ? AND plugin_name IS NULL AND direction = 'outbound' AND type IN ('smtp', 'graph')
+	`, now, id)
+	if err != nil {
+		return fmt.Errorf("promote default outbound mail channel: %w", err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

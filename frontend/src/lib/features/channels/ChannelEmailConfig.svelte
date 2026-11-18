@@ -6,6 +6,7 @@
   import Button from '../../components/Button.svelte';
   import Label from '../../components/Label.svelte';
   import DescriptionText from '../../components/DescriptionText.svelte';
+  import AlertBox from '../../components/AlertBox.svelte';
   import ChannelIntakesSection from './ChannelIntakesSection.svelte';
   import Toggle from '../../components/Toggle.svelte';
   import { publicBaseURL } from '../../runtime/contextPath.js';
@@ -307,9 +308,18 @@
             bind:value={formData.oauth_mailbox}
           />
           <DescriptionText>
-            {t('channel.oauthMailboxHelp')}
+            {formData.oauth_provider_type === 'microsoft'
+              ? t('channel.oauthMailboxHelpMicrosoft')
+              : t('channel.oauthMailboxHelp')}
           </DescriptionText>
         </div>
+
+        {#if formData.oauth_provider_type === 'microsoft'}
+          <AlertBox variant="warning" message={t('channel.microsoftGraphConsent')} />
+          {#if $isSystemAdmin}
+            <DescriptionText>{t('channel.microsoftCentralScopesHelp')}</DescriptionText>
+          {/if}
+        {/if}
 
         <!-- Connection Status -->
         {#if oauthIsConnected}
