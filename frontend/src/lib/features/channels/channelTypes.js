@@ -1,6 +1,7 @@
 import IconForms from '@tabler/icons-svelte-runes/icons/forms';
 import IconLifebuoy from '@tabler/icons-svelte-runes/icons/lifebuoy';
 import IconMail from '@tabler/icons-svelte-runes/icons/mail';
+import IconMailForward from '@tabler/icons-svelte-runes/icons/mail-forward';
 import IconSend from '@tabler/icons-svelte-runes/icons/send';
 import IconStack2 from '@tabler/icons-svelte-runes/icons/stack-2';
 import IconWebhook from '@tabler/icons-svelte-runes/icons/webhook';
@@ -36,6 +37,12 @@ export const channelTypes = [
     icon: IconSend,
     navColor: 'from-ds-nav-orange-from to-ds-nav-orange-to',
     formColor: 'var(--ds-icon-accent-orange)',
+  },
+  {
+    id: 'graph',
+    icon: IconMailForward,
+    navColor: 'from-ds-nav-blue-from to-ds-nav-blue-to',
+    formColor: 'var(--ds-icon-accent-blue)',
   },
 ];
 

@@ -207,3 +207,15 @@ blog/
 /cmd/ws/ws
 /playground
 /CONTEXT.md
+
+# Public Microsoft Graph mail regressions.
+!/internal/database/graph_delta_schema_test.go
+!/internal/email/graph_inbound_regression_test.go
+!/internal/graph/mail_test.go
+!/internal/graph/policy_test.go
+!/internal/outbound/dispatcher_test.go
+!/internal/repository/channel_graph_config_test.go
+!/internal/scheduler/graph_poison_test.go
+!/internal/services/channel_graph_config_test.go
+!/internal/services/channel_graph_policy_test.go
+!/internal/smtp/configured_sender_test.go

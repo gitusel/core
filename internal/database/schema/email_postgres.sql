@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS email_intake_state (
 	failed_message_uid INTEGER NOT NULL DEFAULT 0,
 	failed_message_uid_validity BIGINT NOT NULL DEFAULT 0,
 	failed_message_count INTEGER NOT NULL DEFAULT 0,
+	graph_delta_link TEXT NOT NULL DEFAULT '',
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	FOREIGN KEY (intake_id) REFERENCES intakes(id) ON DELETE CASCADE

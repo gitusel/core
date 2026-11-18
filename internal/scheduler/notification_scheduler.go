@@ -75,7 +75,7 @@ type NotificationScheduler struct {
 // SMTPSender interface for sending emails
 type SMTPSender interface {
 	SendBatchedNotificationsContext(ctx context.Context, userEmail, userName, locale, timezone string, notifications []models.Notification) error
-	IsSMTPConfigured() bool
+	IsConfigured() bool
 }
 
 type emailReplyOutbox interface {
@@ -239,7 +239,7 @@ func (ns *NotificationScheduler) processPendingNotificationsContext(ctx context.
 	defer recordSchedulerRun(ns.runRepo, "notification", start, &batchesProcessed, &runErr, ns.now)
 
 	// Check if SMTP is configured first
-	if !ns.smtpSender.IsSMTPConfigured() {
+	if !ns.smtpSender.IsConfigured() {
 		slog.Debug("SMTP not configured, skipping notification batch processing", slog.String("component", "scheduler"))
 		return
 	}

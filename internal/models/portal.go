@@ -59,7 +59,7 @@ func NotificationMetadataJSON(titleKey, messageKey string, params map[string]any
 type Channel struct {
 	ID              int        `json:"id"`
 	Name            string     `json:"name"`
-	Type            string     `json:"type"`      // smtp, webhook, imap, portal, widget
+	Type            string     `json:"type"`      // smtp, graph, webhook, imap, portal, widget
 	Direction       string     `json:"direction"` // inbound, outbound
 	Description     string     `json:"description"`
 	Status          string     `json:"status"`                      // enabled, disabled
@@ -81,6 +81,8 @@ type Channel struct {
 	// HasEmailOAuthClientSecret reports that a scrubbed email OAuth client
 	// secret is stored, so the UI can show it as saved without receiving it.
 	HasEmailOAuthClientSecret bool `json:"has_email_oauth_client_secret,omitempty"`
+	// HasGraphClientSecret reports that a scrubbed Graph app secret is stored.
+	HasGraphClientSecret bool `json:"has_graph_client_secret,omitempty"`
 }
 
 // ChannelCategory represents a grouping for channels
@@ -106,6 +108,14 @@ type ChannelConfig struct {
 	SMTPSkipTLSVerify bool   `json:"smtp_skip_tls_verify,omitempty"`
 	SMTPAuthMethod    string `json:"smtp_auth_method,omitempty"` // auto (default), plain, login, cram-md5, none
 
+	// Microsoft Graph (Microsoft 365) Configuration — used by the independent
+	// "graph" outbound channel. Entirely separate from SMTP; a tenant may use
+	// SMTP, Graph, or both side by side.
+	GraphTenantID     string `json:"graph_tenant_id,omitempty"`     // Directory (tenant) ID
+	GraphClientID     string `json:"graph_client_id,omitempty"`     // Application (client) ID
+	GraphClientSecret string `json:"graph_client_secret,omitempty"` // App client secret (encrypted at rest)
+	GraphFromEmail    string `json:"graph_from_email,omitempty"`    // Mailbox UPN to send as (From / sendMail path)
+	GraphFromName     string `json:"graph_from_name,omitempty"`     // Display name for the From header
 	// Webhook Configuration
 	WebhookURL              string            `json:"webhook_url,omitempty"`
 	WebhookSecret           string            `json:"webhook_secret,omitempty"`
@@ -134,11 +144,11 @@ type ChannelConfig struct {
 	EmailOAuthClientSecret string `json:"email_oauth_client_secret,omitempty"` // Encrypted client secret
 	EmailOAuthTenantID     string `json:"email_oauth_tenant_id,omitempty"`     // Microsoft tenant ID (or 'common')
 
-	// EmailOAuthMailbox is the monitored mailbox the admin enters for the OAuth
-	// flow. IMAP XOAUTH2 authenticates as this address, so it is known before
-	// the flow and cannot be derived from the token. Kept separate from
-	// EmailOAuthEmail so a pending address change survives reconnect: the
-	// verified EmailOAuthEmail marks the connection as live.
+	// EmailOAuthMailbox is the monitored mailbox the admin enters before the
+	// OAuth flow. Microsoft Graph opens this mailbox with Mail.ReadWrite;
+	// Google IMAP XOAUTH2 authenticates as it. It cannot be derived from the
+	// token. Kept separate from EmailOAuthEmail so a pending address change
+	// survives reconnect: the verified EmailOAuthEmail marks the connection live.
 	EmailOAuthMailbox string `json:"email_oauth_mailbox,omitempty"`
 
 	// OAuth Tokens (populated after successful OAuth flow)
@@ -762,6 +772,7 @@ type EmailIntakeState struct {
 	FailedMessageUID         int    `json:"-"`
 	FailedMessageUIDValidity uint32 `json:"-"`
 	FailedMessageCount       int    `json:"-"`
+	GraphDeltaLink           string `json:"-"`
 }
 
 // EmailMessageTracking records processed emails for deduplication and reply threading

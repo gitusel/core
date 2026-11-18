@@ -19,8 +19,8 @@ import (
 	"windshift/internal/i18n"
 	"windshift/internal/itemevents"
 	"windshift/internal/models"
+	"windshift/internal/outbound"
 	"windshift/internal/repository"
-	"windshift/internal/smtp"
 )
 
 // EmailReplyService sends threaded SMTP replies to portal customers
@@ -271,7 +271,7 @@ func (s *EmailReplyService) handleCommentCreated(params HandleCommentParams, del
 
 	// Sending immediately keeps the current low-latency behavior. The durable
 	// rows remain pending on failure and are retried by NotificationScheduler.
-	if !deliverImmediately || !s.smtpSender.IsSMTPConfigured() {
+	if !deliverImmediately || !s.smtpSender.IsConfigured() {
 		return nil
 	}
 	s.outboxMu.Lock()
@@ -457,7 +457,7 @@ func (s *EmailReplyService) SendParticipantAddedNotice(itemID, customerID, actor
 // loadNoticeItem loads an item for a customer-facing notice and ensures its
 // portal thread anchor exists. Returns (nil, reason, nil) for expected skips.
 func (s *EmailReplyService) loadNoticeItem(itemID int) (*models.Item, string, error) {
-	if !s.smtpSender.IsSMTPConfigured() {
+	if !s.smtpSender.IsConfigured() {
 		return nil, "smtp_not_configured", nil
 	}
 	item, err := repository.NewItemRepository(s.db).FindByIDWithDetails(itemID)
@@ -552,7 +552,7 @@ func (s *EmailReplyService) sendItemNotice(item *models.Item, toEmail, toName, s
 	smtpDomain := s.getSMTPDomain()
 	messageID := fmt.Sprintf("<ws-notice-%d-%d@%s>", item.ID, time.Now().UnixNano(), smtpDomain)
 	replyToEmail, replyToName := s.resolveReplyToAddress(item.ID, *item.ChannelID)
-	if err := s.smtpSender.SendThreadedEmail(smtp.ThreadedEmailParams{
+	if err := s.smtpSender.SendThreadedEmail(outbound.ThreadedEmailParams{
 		ToEmail:      toEmail,
 		ToName:       toName,
 		ReplyToEmail: replyToEmail,
@@ -595,7 +595,7 @@ func (s *EmailReplyService) sendItemNotice(item *models.Item, toEmail, toName, s
 // delivery, so a reply to it lands on the ticket. Expected skips (missing
 // customer/item, no SMTP) are non-errors.
 func (s *EmailReplyService) EnqueueIntakeConfirmation(itemID, customerID int) error {
-	if !s.smtpSender.IsSMTPConfigured() {
+	if !s.smtpSender.IsConfigured() {
 		return nil
 	}
 	var customerEmail, customerName string
@@ -720,7 +720,7 @@ func (s *EmailReplyService) ProcessPendingReplies(ctx context.Context, limit int
 	if limit <= 0 {
 		limit = 50
 	}
-	if !s.smtpSender.IsSMTPConfigured() {
+	if !s.smtpSender.IsConfigured() {
 		return 0, nil
 	}
 
@@ -811,7 +811,7 @@ func (s *EmailReplyService) deliverPendingReply(ctx context.Context, outboxID in
 		s.recordReplyFailure(row.ID, row.AttemptCount, err)
 		return false, fmt.Errorf("decode pending email references: %w", err)
 	}
-	err = s.smtpSender.SendThreadedEmailContext(ctx, smtp.ThreadedEmailParams{
+	err = s.smtpSender.SendThreadedEmailContext(ctx, outbound.ThreadedEmailParams{
 		ToEmail:      row.ToEmail,
 		ToName:       row.ToName,
 		ReplyToEmail: row.ReplyToEmail,
@@ -884,11 +884,11 @@ func (s *EmailReplyService) getSMTPFromEmail() string {
 	return smtpFromEmail(s.db)
 }
 
-// fallbackSMTPFromEmail is used when no default outbound SMTP channel is
+// fallbackSMTPFromEmail is used when no default outbound mail channel is
 // configured or its config can't be read.
 const fallbackSMTPFromEmail = "noreply@windshift.local"
 
-// smtpDomain extracts the domain from the default outbound SMTP from email.
+// smtpDomain extracts the domain from the selected outbound from address.
 // Shared by the reply service and the portal thread-anchor minter.
 func smtpDomain(db database.Database) string {
 	fromEmail := smtpFromEmail(db)
@@ -898,26 +898,46 @@ func smtpDomain(db database.Database) string {
 	return "windshift.local"
 }
 
-// smtpFromEmail reads the configured from email of the default outbound SMTP
-// channel, falling back when none is configured or its config can't be read.
+// smtpFromEmail reads the from address of the outbound mail channel the
+// dispatcher would select (default graph or smtp, else legacy smtp). A
+// default webhook does not hide that address.
 func smtpFromEmail(db database.Database) string {
-	var configJSON string
-	err := db.QueryRow(`
-		SELECT COALESCE(config, '{}') FROM channels
-		WHERE type = 'smtp' AND direction = 'outbound'
-		  AND status = 'enabled' AND is_default = true
-		ORDER BY updated_at DESC
-		LIMIT 1
-	`).Scan(&configJSON)
+	channelType, configJSON, err := selectedMailChannel(db)
 	if err != nil {
 		return fallbackSMTPFromEmail
 	}
-
 	var cfg models.ChannelConfig
-	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil || cfg.SMTPFromEmail == "" {
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
 		return fallbackSMTPFromEmail
 	}
-	return cfg.SMTPFromEmail
+	from := strings.TrimSpace(cfg.SMTPFromEmail)
+	if channelType == "graph" {
+		from = strings.TrimSpace(cfg.GraphFromEmail)
+	}
+	if from == "" {
+		return fallbackSMTPFromEmail
+	}
+	return from
+}
+
+func selectedMailChannel(db database.Database) (channelType, configJSON string, err error) {
+	err = db.QueryRow(`
+		SELECT type, COALESCE(config, '{}') FROM channels
+		WHERE direction = 'outbound' AND status = 'enabled' AND is_default = true
+		  AND type IN ('smtp', 'graph')
+		ORDER BY updated_at DESC
+		LIMIT 1
+	`).Scan(&channelType, &configJSON)
+	if err == sql.ErrNoRows {
+		err = db.QueryRow(`
+			SELECT type, COALESCE(config, '{}') FROM channels
+			WHERE direction = 'outbound' AND status = 'enabled'
+			  AND type IN ('smtp', 'graph')
+			ORDER BY CASE type WHEN 'smtp' THEN 0 ELSE 1 END, updated_at DESC
+			LIMIT 1
+		`).Scan(&channelType, &configJSON)
+	}
+	return channelType, configJSON, err
 }
 
 // ErrEmailReplyNotRetryable marks an outbox row an operator cannot re-send:
@@ -997,8 +1017,8 @@ func (s *EmailReplyService) RetryPendingReply(channelID, commentID int) (deliver
 		return false, ErrEmailReplyNotRetryable
 	}
 
-	if !s.smtpSender.IsSMTPConfigured() {
-		return false, ErrSMTPNotConfigured
+	if !s.smtpSender.IsConfigured() {
+		return false, outbound.ErrNotConfigured
 	}
 
 	// Retry scheduling never steals a live claim: the reset only applies

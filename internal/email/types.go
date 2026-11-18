@@ -104,6 +104,39 @@ type Provider interface {
 	TestConnection(ctx context.Context, config *models.ChannelConfig) error
 }
 
+// GraphDeltaStore is implemented by the Graph mailbox client. The scheduler
+// restores and commits one opaque checkpoint per intake. SelectMailbox clears
+// the in-memory link so one intake cannot reuse another's cursor; the
+// scheduler restores this intake's checkpoint afterward. A checkpoint from
+// another folder is ignored. The resume URL inside it is an @odata.nextLink
+// or @odata.deltaLink, not an IMAP UID.
+type GraphDeltaStore interface {
+	RestoreGraphDelta(link string)
+	GraphDelta() string
+}
+
+// GraphCursorControl is the Graph mailbox client's folder, poison, and page
+// acknowledgement state. IMAP clients do not implement it. The checkpoint
+// string from GraphDelta carries the folder, the baseline cutoff, and the
+// poison Graph id so those survive in the existing graph_delta_link column.
+type GraphCursorControl interface {
+	GraphFolderMismatch() bool
+	GraphMessageID(uid uint32) (string, bool)
+	Poison() (id string, count int, ok bool)
+	SetGraphPoison(id string, count int)
+	OmitExhaustedPoison(max int)
+	HoldGraphResume()
+	AcceptGraphPage()
+}
+
+// GraphBaselineSync is implemented by the Graph mailbox client. A new intake
+// that must not import existing mail acknowledges the folder's current state
+// without downloading it. One call advances at most one page. IMAP clients do
+// not implement this; their UIDNEXT skip path is unchanged.
+type GraphBaselineSync interface {
+	EstablishBaseline(ctx context.Context, pageSize int) (done bool, err error)
+}
+
 // OAuthProvider extends Provider with OAuth-specific functionality
 //
 // The monitored mailbox address is configuration, not something the provider

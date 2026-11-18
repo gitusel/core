@@ -16,7 +16,6 @@ import (
 	"windshift/internal/i18n"
 	"windshift/internal/markdown"
 	"windshift/internal/models"
-	"windshift/internal/smtp"
 )
 
 // MentionEmailData is the template payload for the dedicated mention email.
@@ -176,7 +175,7 @@ func (s *MentionEmailService) ProcessPendingMentions(ctx context.Context, limit 
 	if limit <= 0 {
 		limit = 50
 	}
-	if !s.sender.IsSMTPConfigured() {
+	if !s.sender.IsConfigured() {
 		return 0, nil
 	}
 
@@ -300,7 +299,7 @@ func (s *MentionEmailService) deliverPendingMention(ctx context.Context, outboxI
 		// Strip the embedded id once so every template, including an admin
 		// override that renders .Content directly, shows the display name.
 		Content:   markdown.StripMentionIDs(row.Content),
-		ActionURL: smtp.AbsoluteActionURL(s.baseURL, row.ActionURL),
+		ActionURL: emailutil.AbsoluteActionURL(s.baseURL, row.ActionURL),
 	}
 	if err := s.sender.SendTransactionalContext(ctx, row.ToEmail, locale, emailutil.TemplateMention, data); err != nil {
 		s.recordMentionFailure(row.ID, row.AttemptCount, err)

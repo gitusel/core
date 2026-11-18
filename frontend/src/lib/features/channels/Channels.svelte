@@ -340,7 +340,8 @@
         'form': 'inbound',
         'webhook': 'outbound',
         'email': 'inbound',
-        'smtp': 'outbound'
+        'smtp': 'outbound',
+        'graph': 'outbound'
       };
       const direction = directionMap[channelFormData.type] || 'outbound';
 

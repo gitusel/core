@@ -600,9 +600,8 @@ func (h *EmailProviderHandler) StartEmailOAuth(w http.ResponseWriter, r *http.Re
 		respondInternalError(w, r, err)
 		return
 	}
-	// The monitored mailbox is entered by the admin and is what IMAP XOAUTH2
-	// authenticates as; require it before starting so the callback never has to
-	// guess an identity from the token.
+	// Require the configured mailbox before OAuth. The callback must not guess
+	// the monitored address from identity claims in the access token.
 	var startingChannelConfig models.ChannelConfig
 	if startingConfig != "" {
 		if err := json.Unmarshal([]byte(startingConfig), &startingChannelConfig); err != nil {

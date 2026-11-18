@@ -3460,6 +3460,14 @@ CREATE INDEX IF NOT EXISTS idx_plane_import_mappings_windshift ON plane_import_m
 		SQLite:   `ALTER TABLE time_projects ADD COLUMN currency TEXT NOT NULL DEFAULT ''`,
 		Postgres: `ALTER TABLE time_projects ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT ''`,
 	},
+	{
+		Version:       "20261117_intake_graph_delta",
+		Name:          "Persist the Graph delta link per email intake",
+		CheckSQLite:   sqliteColumnCheck("email_intake_state", "graph_delta_link"),
+		CheckPostgres: pgColumnCheck("email_intake_state", "graph_delta_link"),
+		SQLite:        `ALTER TABLE email_intake_state ADD COLUMN graph_delta_link TEXT NOT NULL DEFAULT ''`,
+		Postgres:      `ALTER TABLE email_intake_state ADD COLUMN IF NOT EXISTS graph_delta_link TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 const timeWorklogDraftsMigrationSQLite = `

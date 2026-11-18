@@ -14,6 +14,7 @@ import (
 	"windshift/internal/logger"
 	"windshift/internal/middleware"
 	"windshift/internal/models"
+	"windshift/internal/outbound"
 	"windshift/internal/repository"
 	"windshift/internal/services"
 	"windshift/internal/utils"
@@ -630,7 +631,7 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 				"success": true,
 				"message": "If your account exists, a verification email will be sent",
 			})
-		case services.ErrSMTPNotConfigured:
+		case outbound.ErrNotConfigured:
 			respondServiceUnavailable(w, r, "Email service is not available")
 		default:
 			slog.Error("failed to resend verification", slog.String("component", "auth"), slog.Any("error", err))

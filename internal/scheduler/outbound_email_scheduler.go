@@ -177,7 +177,7 @@ func (os *OutboundEmailScheduler) processOutboundEmails(ctx context.Context) {
 	var runErr error
 	defer recordSchedulerRun(os.runRepo, outboundEmailSchedulerName, start, &delivered, &runErr, os.now)
 
-	if os.smtpSender != nil && !os.smtpSender.IsSMTPConfigured() {
+	if os.smtpSender != nil && !os.smtpSender.IsConfigured() {
 		slog.Debug("SMTP not configured, skipping outbound email drain", slog.String("component", "scheduler"))
 		return
 	}

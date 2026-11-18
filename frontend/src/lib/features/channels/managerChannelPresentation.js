@@ -26,7 +26,7 @@ export function managerChannelPurpose(channel, workspaceName = '') {
       params: { workspace: workspaceName || String(config.email_workspace_id || '') },
     };
   }
-  if (channel?.type === 'smtp') {
+  if (channel?.type === 'smtp' || channel?.type === 'graph') {
     return { key: 'channels.manager.outboundNotifications', params: {} };
   }
   if (channel?.type === 'webhook') {

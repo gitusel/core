@@ -70,7 +70,7 @@ var channelSlugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`)
 // A partial update treats an omitted or blank value as "keep the stored
 // ciphertext" so a form that echoes back an unedited secret cannot delete it.
 // JSON null is the explicit way to clear one.
-var channelSecretFields = []string{"smtp_password", "imap_password", "webhook_secret", "email_oauth_client_secret"}
+var channelSecretFields = []string{"smtp_password", "imap_password", "webhook_secret", "email_oauth_client_secret", "graph_client_secret"}
 
 func isChannelSecretField(key string) bool {
 	return slices.Contains(channelSecretFields, key)
@@ -238,7 +238,8 @@ func (s *ChannelConfigUpdateService) PrepareEnable(ctx context.Context, actorUse
 	needsConfig := (channel.Type == "email" && channel.Direction == "inbound") ||
 		channel.Type == "portal" || channel.Type == "form" ||
 		(channel.Type == "webhook" && channel.Direction == "outbound") ||
-		(channel.Type == "smtp" && channel.Direction == "outbound")
+		(channel.Type == "smtp" && channel.Direction == "outbound") ||
+		(channel.Type == "graph" && channel.Direction == "outbound")
 	if !needsConfig {
 		return "", nil
 	}
@@ -274,6 +275,10 @@ func (s *ChannelConfigUpdateService) PrepareEnable(ctx context.Context, actorUse
 		}
 	case "smtp":
 		if err := s.prepareSMTPEnable(&config); err != nil {
+			return "", err
+		}
+	case "graph":
+		if err := s.prepareGraphEnable(&config); err != nil {
 			return "", err
 		}
 	}
@@ -466,6 +471,33 @@ func (s *ChannelConfigUpdateService) prepareSMTPEnable(config *models.ChannelCon
 	return nil
 }
 
+// prepareGraphEnable validates an outbound Graph channel before activation:
+// tenant, client, secret and From mailbox are required. The client secret stays
+// at rest until send time; validation does not call Graph.
+func (s *ChannelConfigUpdateService) prepareGraphEnable(config *models.ChannelConfig) error {
+	return validateGraphEnable(config)
+}
+
+func validateGraphEnable(config *models.ChannelConfig) error {
+	if strings.TrimSpace(config.GraphTenantID) == "" {
+		return channelConfigInvalid("Graph tenant ID is required")
+	}
+	if strings.TrimSpace(config.GraphClientID) == "" {
+		return channelConfigInvalid("Graph client ID is required")
+	}
+	if strings.TrimSpace(config.GraphClientSecret) == "" {
+		return channelConfigInvalid("Graph client secret is required")
+	}
+	from := strings.TrimSpace(config.GraphFromEmail)
+	if from == "" {
+		return channelConfigInvalid("Graph from address is required")
+	}
+	if !validBareEmail(from) {
+		return channelConfigInvalid("Graph from address must be a valid bare email address")
+	}
+	return nil
+}
+
 func mergeChannelConfig(existingJSON string, incoming map[string]any) (map[string]any, models.ChannelConfig, error) {
 	merged := make(map[string]any)
 	var stored models.ChannelConfig
@@ -484,6 +516,8 @@ func mergeChannelConfig(existingJSON string, incoming map[string]any) (map[strin
 	previousClientID, _ := merged["email_oauth_client_id"].(string)
 	previousTenantID, _ := merged["email_oauth_tenant_id"].(string)
 	previousMailbox := effectiveOAuthMailbox(merged)
+	previousGraphClient, _ := merged["graph_client_id"].(string)
+	previousGraphTenant, _ := merged["graph_tenant_id"].(string)
 	for key, value := range incoming {
 		if isChannelSecretField(key) {
 			if value == nil {
@@ -514,6 +548,15 @@ func mergeChannelConfig(existingJSON string, incoming map[string]any) (map[strin
 			if secret, _ := incoming["email_oauth_client_secret"].(string); secret == "" {
 				delete(merged, "email_oauth_client_secret")
 			}
+		}
+	}
+	currentGraphClient, _ := merged["graph_client_id"].(string)
+	currentGraphTenant, _ := merged["graph_tenant_id"].(string)
+	// A blank secret is not a new credential. Changing the Graph app identity
+	// discards the secret that belonged to the previous app.
+	if previousGraphClient != currentGraphClient || previousGraphTenant != currentGraphTenant {
+		if secret, _ := incoming["graph_client_secret"].(string); secret == "" {
+			delete(merged, "graph_client_secret")
 		}
 	}
 	return merged, stored, nil
@@ -949,6 +992,8 @@ func validateEnabledChannel(channel *models.Channel, config *models.ChannelConfi
 		if err := windshiftsmtp.ValidateTransport(config); err != nil {
 			return channelConfigInvalid(err.Error())
 		}
+	case "graph":
+		return validateGraphEnable(config)
 	}
 	return nil
 }
