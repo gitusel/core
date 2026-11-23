@@ -459,7 +459,16 @@ func (b *GraphMailbox) fetchRound(ctx context.Context, cursor GraphMailboxCursor
 // Graph message id, which is stable across polls; unlike the per-poll UID the
 // IMAP-shaped adapter invents, it can be persisted, acknowledged, and compared.
 func (b *GraphMailbox) PollMessages(ctx context.Context, cursor GraphMailboxCursor, pageSize int) ([]*mailmsg.Message, GraphMailboxCursor, error) {
-	fetched, next, err := b.fetchRound(ctx, cursor, pageSize, time.Time{}, "")
+	return b.PollMessagesSince(ctx, cursor, pageSize, time.Time{}, "")
+}
+
+// PollMessagesSince is PollMessages with the baseline cutoff and exhausted
+// poison id the poller carries. Both must reach fetchRound: without notBefore a
+// mailbox primed by Seed would re-ingest the history the baseline skipped, and
+// without omitID a poison message that exhausted its retries would be fetched
+// forever.
+func (b *GraphMailbox) PollMessagesSince(ctx context.Context, cursor GraphMailboxCursor, pageSize int, notBefore time.Time, omitID string) ([]*mailmsg.Message, GraphMailboxCursor, error) {
+	fetched, next, err := b.fetchRound(ctx, cursor, pageSize, notBefore, omitID)
 	if err != nil {
 		return nil, cursor, err
 	}
