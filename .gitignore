@@ -204,3 +204,15 @@ blog/
 !/internal/services/channel_graph_config_test.go
 !/internal/services/channel_graph_policy_test.go
 !/internal/smtp/configured_sender_test.go
+
+# Public transport-separation guards and contract regressions. These enforce the
+# rule that the Graph and Teams packages carry no IMAP or SMTP dependency, so
+# they must live in the public tree rather than being overlay-only.
+!/internal/graph/no_imap_test.go
+!/internal/graph/mailbox_neutral_test.go
+!/internal/graph/mailbox_source_test.go
+!/internal/teams/isolation_test.go
+!/internal/email/microsoft_capabilities_test.go
+!/internal/email/microsoft_mailbox_test.go
+!/internal/email/mailbox_imap_test.go
+!/internal/email/parser_message_test.go
