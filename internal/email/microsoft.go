@@ -12,6 +12,7 @@ import (
 	"windshift/internal/graph"
 	"windshift/internal/mailbox"
 	"windshift/internal/models"
+	"windshift/internal/teams"
 )
 
 // Microsoft 365 IMAP settings
@@ -156,6 +157,21 @@ func (p *MicrosoftProvider) OpenMailbox(ctx context.Context, config *models.Chan
 		return nil, err
 	}
 	return graph.NewGraphMailbox(box), nil
+}
+
+// OpenChannel declares the Microsoft Teams capability.
+//
+// Graph serves mail and Teams through the same app registration, but a channel
+// is not a mailbox: it has no folders, no UID space, and no per-message
+// read/delete. Mail is reached through OpenMailbox and Teams through here, so
+// adding a third workload (SharePoint files) is another capability rather than
+// a redesign of either.
+//
+// The workload is not implemented yet. This returns ErrNotAvailable instead of
+// a source that would silently deliver nothing, so a configured channel cannot
+// look healthy while no message ever arrives.
+func (p *MicrosoftProvider) OpenChannel(context.Context, *models.ChannelConfig, teams.ChannelRef) (teams.Source, error) {
+	return nil, fmt.Errorf("microsoft Teams channels are declared but not implemented yet: %w", teams.ErrNotAvailable)
 }
 
 // Connect refuses to present Graph mail as an IMAP client.
