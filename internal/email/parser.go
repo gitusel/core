@@ -14,6 +14,8 @@ import (
 	goMessage "github.com/emersion/go-message"
 	_ "github.com/emersion/go-message/charset"
 	"github.com/microcosm-cc/bluemonday"
+
+	"windshift/internal/mailmsg"
 )
 
 var (
@@ -36,6 +38,20 @@ func NewParser() *Parser {
 	return &Parser{
 		maxAttachmentSize: 10 * 1024 * 1024, // 10MB default
 	}
+}
+
+// ParseMessage converts a transport-neutral message into a ParsedEmail.
+//
+// It exists so a Graph, Teams, or file mailbox can reuse this parser without
+// presenting an IMAP envelope: identity, threading, addresses, and body are all
+// recovered from the raw RFC 5322 bytes. The UID is left zero because a
+// non-IMAP transport has no UID space; callers that need to act on the message
+// later carry the ref alongside it (see mailmsg.Message.Ref), not in here.
+func (p *Parser) ParseMessage(msg *mailmsg.Message) *ParsedEmail {
+	if msg == nil {
+		return &ParsedEmail{RawHeaders: make(map[string][]string)}
+	}
+	return p.Parse(&FetchedMessage{Raw: msg.Raw, FetchError: msg.FetchError})
 }
 
 // Parse converts a fetched IMAP message into a ParsedEmail. It never fails: a

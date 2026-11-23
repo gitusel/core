@@ -16,13 +16,13 @@ import (
 	"time"
 
 	"windshift/internal/database"
-	"windshift/internal/email"
 	"windshift/internal/emailutil"
 	"windshift/internal/i18n"
 	"windshift/internal/models"
 	"windshift/internal/operatorcontrols"
 	"windshift/internal/outbound"
 	"windshift/internal/repository"
+	"windshift/internal/secretutil"
 )
 
 // Sender delivers mail through Microsoft Graph. It is constructed per
@@ -89,7 +89,7 @@ func (s *Sender) client(ctx context.Context) (*Client, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	secret, err := email.DecryptOrLegacy(s.encryption, s.cfg.GraphClientSecret)
+	secret, err := secretutil.DecryptOrLegacy(s.encryption, s.cfg.GraphClientSecret)
 	if err != nil {
 		return nil, err
 	}
