@@ -15,6 +15,7 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 
+	"windshift/internal/mailmsg"
 	"windshift/internal/utils"
 )
 
@@ -385,7 +386,17 @@ func (b *GraphMailbox) Poll(ctx context.Context, cursor GraphMailboxCursor, page
 	return b.poll(ctx, cursor, pageSize, time.Time{}, "")
 }
 
-func (b *GraphMailbox) poll(ctx context.Context, cursor GraphMailboxCursor, pageSize int, notBefore time.Time, omitID string) ([]*FetchedMessage, GraphMailboxCursor, error) {
+// graphFetched is one message from a delta round, addressed by its Graph id.
+// Both the IMAP-shaped Poll and the neutral PollMessages project from it, so
+// the page-draining and MIME rules live in exactly one place.
+type graphFetched struct {
+	Ref    string
+	Raw    []byte
+	Err    error
+	IsRead bool
+}
+
+func (b *GraphMailbox) fetchRound(ctx context.Context, cursor GraphMailboxCursor, pageSize int, notBefore time.Time, omitID string) ([]graphFetched, GraphMailboxCursor, error) {
 	// Drain every page of this round. Graph caps a page at odata.maxpagesize
 	// and hands back @odata.nextLink until the round is complete; stopping
 	// after the first page would strand the rest behind a nextLink that the
@@ -410,10 +421,8 @@ func (b *GraphMailbox) poll(ctx context.Context, cursor GraphMailboxCursor, page
 			return nil, cursor, err
 		}
 	}
-	resume := current.DeltaLink
-	messages := make([]*FetchedMessage, 0, len(items))
-	ids := make(map[uint32]string, len(items))
-	read := make(map[uint32]bool, len(items))
+
+	fetched := make([]graphFetched, 0, len(items))
 	for _, item := range items {
 		if item.ID == omitID || !item.ingest() || !item.arrivedAfter(notBefore) {
 			continue
@@ -421,17 +430,12 @@ func (b *GraphMailbox) poll(ctx context.Context, cursor GraphMailboxCursor, page
 		if err := ctx.Err(); err != nil {
 			return nil, cursor, err
 		}
-		// UIDs are per poll only. Mail without a Message-ID is deduped by a
-		// Graph-ID fallback header, not this number. A stable hash would make
-		// a later page's different message look like one already ingested.
-		uid := uint32(len(messages) + 1)
 		raw, err := b.getMIME(ctx, item.ID)
 		if errors.Is(err, errGraphMessageTooLarge) {
-			messages = append(messages, &FetchedMessage{
-				UID:        uid,
-				FetchError: fmt.Errorf("graph message exceeds %d-byte limit", graphMIMEReadLimit),
+			fetched = append(fetched, graphFetched{
+				Ref: item.ID,
+				Err: fmt.Errorf("graph message exceeds %d-byte limit", graphMIMEReadLimit),
 			})
-			ids[uid] = item.ID
 			continue
 		}
 		if err != nil {
@@ -441,15 +445,54 @@ func (b *GraphMailbox) poll(ctx context.Context, cursor GraphMailboxCursor, page
 			}
 			return nil, cursor, err
 		}
-		messages = append(messages, &FetchedMessage{UID: uid, Raw: withGraphFallbackMessageID(raw, item.ID)})
-		ids[uid] = item.ID
-		if known, isRead := item.readKnown(); known && isRead {
+		known, isRead := item.readKnown()
+		fetched = append(fetched, graphFetched{
+			Ref:    item.ID,
+			Raw:    withGraphFallbackMessageID(raw, item.ID),
+			IsRead: known && isRead,
+		})
+	}
+	return fetched, GraphMailboxCursor{DeltaLink: current.DeltaLink}, nil
+}
+
+// PollMessages returns this round as transport-neutral messages. The ref is the
+// Graph message id, which is stable across polls; unlike the per-poll UID the
+// IMAP-shaped adapter invents, it can be persisted, acknowledged, and compared.
+func (b *GraphMailbox) PollMessages(ctx context.Context, cursor GraphMailboxCursor, pageSize int) ([]*mailmsg.Message, GraphMailboxCursor, error) {
+	fetched, next, err := b.fetchRound(ctx, cursor, pageSize, time.Time{}, "")
+	if err != nil {
+		return nil, cursor, err
+	}
+	messages := make([]*mailmsg.Message, 0, len(fetched))
+	for _, f := range fetched {
+		messages = append(messages, &mailmsg.Message{Ref: f.Ref, Raw: f.Raw, FetchError: f.Err})
+	}
+	return messages, next, nil
+}
+
+// poll keeps the IMAP-shaped result for the existing poller. UIDs here are
+// per-poll ordinals: they order one batch and nothing more. A message without
+// a Message-ID is deduplicated by the Graph-id fallback header, not by these
+// numbers.
+func (b *GraphMailbox) poll(ctx context.Context, cursor GraphMailboxCursor, pageSize int, notBefore time.Time, omitID string) ([]*FetchedMessage, GraphMailboxCursor, error) {
+	fetched, next, err := b.fetchRound(ctx, cursor, pageSize, notBefore, omitID)
+	if err != nil {
+		return nil, cursor, err
+	}
+	messages := make([]*FetchedMessage, 0, len(fetched))
+	ids := make(map[uint32]string, len(fetched))
+	read := make(map[uint32]bool, len(fetched))
+	for _, f := range fetched {
+		uid := uint32(len(messages) + 1)
+		messages = append(messages, &FetchedMessage{UID: uid, Raw: f.Raw, FetchError: f.Err})
+		ids[uid] = f.Ref
+		if f.IsRead {
 			read[uid] = true
 		}
 	}
 	b.idsByUID = ids
 	b.readByUID = read
-	return messages, GraphMailboxCursor{DeltaLink: resume}, nil
+	return messages, next, nil
 }
 
 // baselinePage advances one delta page without downloading MIME. done is true
