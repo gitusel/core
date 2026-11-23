@@ -19,16 +19,10 @@ import (
 	"windshift/internal/models"
 )
 
-var (
-	// ErrNotAvailable reports that a provider can reach Teams in principle but
-	// this build does not implement it yet. It is distinct from a configuration
-	// or credential error so an operator sees "not implemented", not
-	// "misconfigured".
-	ErrNotAvailable = errors.New("teams workload is not implemented yet")
-	// ErrMissingConfig reports that the provider cannot open the channel with the
-	// configuration it was given.
-	ErrMissingConfig = errors.New("teams channel configuration is incomplete")
-)
+// ErrNotAvailable reports that a provider can reach Teams in principle but this
+// build does not implement it yet. It is distinct from a configuration or
+// credential error so an operator sees "not implemented", not "misconfigured".
+var ErrNotAvailable = errors.New("teams workload is not implemented yet")
 
 // ChannelRef identifies one channel. Teams addresses messages by team and
 // channel id; there is no folder to select and no stable ordinal.
