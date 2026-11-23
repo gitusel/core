@@ -1,9 +1,9 @@
 // This file contains the Microsoft Graph mail provider. It is the Graph-side
 // twin of internal/smtp/notification_sender.go: it owns delivery of mail via
-// Microsoft Graph's /sendMail endpoint. It shares nothing with the SMTP
-// package; shared behavior (templates, notification rendering, template
-// repository, secret decryption) lives in internal/emailutil and
-// internal/email.
+// Microsoft Graph's /sendMail endpoint. It shares nothing with the SMTP or IMAP
+// packages; shared behavior (templates, notification rendering, template
+// repository, secret decryption) lives in internal/emailutil, internal/mailmsg,
+// and internal/secretutil.
 package graph
 
 import (

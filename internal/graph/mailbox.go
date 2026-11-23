@@ -1,4 +1,4 @@
-package email
+package graph
 
 import (
 	"bytes"
@@ -17,11 +17,16 @@ import (
 	"windshift/internal/utils"
 )
 
+// MIMEReadLimit is the largest message body this package will read. It is
+// exported so a caller bounding its own test fixtures shares the real limit
+// instead of duplicating the number.
+const MIMEReadLimit = 20 << 20
+
 const (
 	defaultGraphPageSize = 50
 	maxGraphPageSize     = 100
 	maxGraphJSONBytes    = 4 << 20
-	graphMIMEReadLimit   = 20 << 20
+	graphMIMEReadLimit   = MIMEReadLimit
 	// maxGraphDeltaPages bounds one poll round. Graph completes a round with
 	// a deltaLink; this only stops a server that keeps handing back the same
 	// nextLink from looping forever.
@@ -51,13 +56,11 @@ type GraphMailboxCursor struct {
 
 // GraphMailbox reads one mailbox folder through Microsoft Graph.
 type GraphMailbox struct {
-	baseURL   string
-	token     string
-	mailbox   string
-	folder    string
-	http      *http.Client
-	idsByUID  map[uint32]string
-	readByUID map[uint32]bool
+	baseURL string
+	token   string
+	mailbox string
+	folder  string
+	http    *http.Client
 	// readByID records which messages the last PollMessages round reported as
 	// already read, keyed by Graph id. MarkRead on one of those would be a
 	// redundant PATCH and can race a concurrent reader.
@@ -146,6 +149,13 @@ func (b *GraphMailbox) SelectFolder(name string) error {
 	}
 	b.folder = name
 	return nil
+}
+
+// ValidateFolder confirms the folder exists in the mailbox, using a real Graph
+// call. SelectFolder only maps well-known names locally, so a connection test
+// must use this instead of selecting.
+func (b *GraphMailbox) ValidateFolder(ctx context.Context, name string) error {
+	return b.bindFolder(ctx, name)
 }
 
 // bindFolder validates the folder and stores the segment used in delta URLs.
@@ -379,15 +389,6 @@ type graphDeltaPageResponse struct {
 	DeltaLink string           `json:"@odata.deltaLink"`
 }
 
-// Poll reads one delta page and downloads MIME for messages that are actually
-// new. pageSize bounds that page. The returned cursor is the page resume URL
-// and must be persisted only after every returned message has a durable
-// outcome. On error the previous cursor is unchanged; callers must not store
-// an empty link over a saved one.
-func (b *GraphMailbox) Poll(ctx context.Context, cursor GraphMailboxCursor, pageSize int) ([]*FetchedMessage, GraphMailboxCursor, error) {
-	return b.poll(ctx, cursor, pageSize, time.Time{}, "")
-}
-
 // graphFetched is one message from a delta round, addressed by its Graph id.
 // Both the IMAP-shaped Poll and the neutral PollMessages project from it, so
 // the page-draining and MIME rules live in exactly one place.
@@ -483,31 +484,6 @@ func (b *GraphMailbox) PollMessagesSince(ctx context.Context, cursor GraphMailbo
 		}
 	}
 	b.readByID = read
-	return messages, next, nil
-}
-
-// poll keeps the IMAP-shaped result for the existing poller. UIDs here are
-// per-poll ordinals: they order one batch and nothing more. A message without
-// a Message-ID is deduplicated by the Graph-id fallback header, not by these
-// numbers.
-func (b *GraphMailbox) poll(ctx context.Context, cursor GraphMailboxCursor, pageSize int, notBefore time.Time, omitID string) ([]*FetchedMessage, GraphMailboxCursor, error) {
-	fetched, next, err := b.fetchRound(ctx, cursor, pageSize, notBefore, omitID)
-	if err != nil {
-		return nil, cursor, err
-	}
-	messages := make([]*FetchedMessage, 0, len(fetched))
-	ids := make(map[uint32]string, len(fetched))
-	read := make(map[uint32]bool, len(fetched))
-	for _, f := range fetched {
-		uid := uint32(len(messages) + 1)
-		messages = append(messages, &FetchedMessage{UID: uid, Raw: f.Raw, FetchError: f.Err})
-		ids[uid] = f.Ref
-		if f.IsRead {
-			read[uid] = true
-		}
-	}
-	b.idsByUID = ids
-	b.readByUID = read
 	return messages, next, nil
 }
 

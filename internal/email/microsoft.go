@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 
+	"windshift/internal/graph"
 	"windshift/internal/mailbox"
 	"windshift/internal/models"
 )
@@ -154,7 +155,7 @@ func (p *MicrosoftProvider) OpenMailbox(ctx context.Context, config *models.Chan
 	if err != nil {
 		return nil, err
 	}
-	return NewGraphMailbox(box), nil
+	return graph.NewGraphMailbox(box), nil
 }
 
 // Connect refuses to present Graph mail as an IMAP client.
@@ -168,7 +169,7 @@ func (p *MicrosoftProvider) Connect(context.Context, *models.ChannelConfig) (IMA
 }
 
 // openGraphMailbox validates the delegated grant and builds the Graph reader.
-func (p *MicrosoftProvider) openGraphMailbox(ctx context.Context, config *models.ChannelConfig) (*GraphMailbox, error) {
+func (p *MicrosoftProvider) openGraphMailbox(ctx context.Context, config *models.ChannelConfig) (*graph.GraphMailbox, error) {
 	mailbox := strings.TrimSpace(config.EmailOAuthEmail)
 	if mailbox == "" {
 		mailbox = strings.TrimSpace(config.EmailOAuthMailbox)
@@ -182,7 +183,7 @@ func (p *MicrosoftProvider) openGraphMailbox(ctx context.Context, config *models
 	if err := microsoftGrantRequiresReauthorization(config.EmailOAuthAccessToken); err != nil {
 		return nil, err
 	}
-	return OpenGraphMailbox(ctx, GraphMailboxConfig{
+	return graph.OpenGraphMailbox(ctx, graph.GraphMailboxConfig{
 		BaseURL:    p.graphBaseURL,
 		Token:      config.EmailOAuthAccessToken,
 		Mailbox:    mailbox,
@@ -205,7 +206,7 @@ func (p *MicrosoftProvider) TestConnection(ctx context.Context, config *models.C
 	// SelectFolder only maps well-known names locally; validating connection
 	// requires confirming the folder exists in the mailbox, which bindFolder
 	// does with a real Graph call and a not-found error.
-	return box.bindFolder(ctx, folder)
+	return box.ValidateFolder(ctx, folder)
 }
 
 func microsoftGraphScopes(scopes []string) []string {
