@@ -7,10 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emersion/go-imap/v2"
-
 	"windshift/internal/database"
-	"windshift/internal/email"
+	"windshift/internal/mailbox"
 	"windshift/internal/models"
 )
 
@@ -34,9 +32,9 @@ func TestGraphPoisonContinuesOnlyAfterRepeatedFailures(t *testing.T) {
 func TestGraphBaselineDonePersistsCursorAndValidityTogether(t *testing.T) {
 	db := &graphBaselineDB{}
 	es := &EmailScheduler{db: db}
-	client := &fakeGraphCursor{link: "https://graph.example/users/box/mailFolders/inbox/messages/delta?$deltatoken=done"}
+	client := &fakeMailbox{link: "https://graph.example/users/box/mailFolders/inbox/messages/delta?$deltatoken=done"}
 	intake := &models.Intake{ID: 7}
-	if err := es.commitGraphBaseline(context.Background(), channelInfo{ID: 3}, intake, client, true, 1); err != nil {
+	if err := es.commitGraphBaseline(context.Background(), channelInfo{ID: 3}, intake, client, true); err != nil {
 		t.Fatalf("commit done baseline: %v", err)
 	}
 	if db.writes != 1 {
@@ -46,12 +44,12 @@ func TestGraphBaselineDonePersistsCursorAndValidityTogether(t *testing.T) {
 		t.Fatalf("query = %q, want the resume link and validity in the same update", db.query)
 	}
 	db.err = errors.New("disk full")
-	if err := es.commitGraphBaseline(context.Background(), channelInfo{ID: 3}, intake, client, true, 1); err == nil {
+	if err := es.commitGraphBaseline(context.Background(), channelInfo{ID: 3}, intake, client, true); err == nil {
 		t.Fatal("baseline write failure must surface so the next tick retries instead of discarding incremental mail")
 	}
 	db.err = nil
 	db.writes = 0
-	if err := es.commitGraphBaseline(context.Background(), channelInfo{ID: 3}, intake, client, false, 1); err != nil {
+	if err := es.commitGraphBaseline(context.Background(), channelInfo{ID: 3}, intake, client, false); err != nil {
 		t.Fatalf("commit partial baseline: %v", err)
 	}
 	if strings.Contains(db.query, "uid_validity") {
@@ -59,20 +57,24 @@ func TestGraphBaselineDonePersistsCursorAndValidityTogether(t *testing.T) {
 	}
 }
 
-type fakeGraphCursor struct {
+// fakeMailbox is a minimal Mailbox whose checkpoint is a fixed string. It
+// stands in for any transport: the baseline commit only cares that the
+// checkpoint is one opaque value.
+type fakeMailbox struct {
 	link string
 }
 
-func (f *fakeGraphCursor) SelectMailbox(string) (*imap.SelectData, error) { return nil, nil }
-func (f *fakeGraphCursor) FetchMessages(uint32, int) ([]*email.FetchedMessage, error) {
-	return nil, nil
+func (f *fakeMailbox) Open(context.Context, string, bool) (mailbox.Info, error) {
+	return mailbox.Info{}, nil
 }
-func (f *fakeGraphCursor) MarkAsRead(uint32) error    { return nil }
-func (f *fakeGraphCursor) DeleteMessage(uint32) error { return nil }
-func (f *fakeGraphCursor) Expunge() error             { return nil }
-func (f *fakeGraphCursor) Close() error               { return nil }
-func (f *fakeGraphCursor) RestoreGraphDelta(string)   {}
-func (f *fakeGraphCursor) GraphDelta() string         { return f.link }
+func (f *fakeMailbox) Fetch(context.Context, int) ([]mailbox.Delivery, error) { return nil, nil }
+func (f *fakeMailbox) MarkRead(context.Context, string) error                 { return nil }
+func (f *fakeMailbox) Delete(context.Context, string) error                   { return nil }
+func (f *fakeMailbox) Expunge(context.Context) error                          { return nil }
+func (f *fakeMailbox) Restore(string)                                         {}
+func (f *fakeMailbox) Acknowledge()                                           {}
+func (f *fakeMailbox) Close() error                                           { return nil }
+func (f *fakeMailbox) Checkpoint() string                                     { return f.link }
 
 type graphBaselineDB struct {
 	query  string
@@ -117,3 +119,25 @@ type graphBaselineResult int64
 
 func (r graphBaselineResult) LastInsertId() (int64, error) { return 0, nil }
 func (r graphBaselineResult) RowsAffected() (int64, error) { return int64(r), nil }
+
+// TestResumeCheckpointCoversBothTransports pins that a mailbox is restored from
+// whatever the previous tick committed. Graph keeps an opaque link; IMAP used to
+// keep numeric columns, and rows written before the checkpoint column carried a
+// link must still resume rather than refetch from UID 0.
+func TestResumeCheckpointCoversBothTransports(t *testing.T) {
+	graph := &models.EmailIntakeState{
+		GraphDeltaLink: "ws-graph-v1\nfolder=inbox\nhttps://graph.example/delta?$deltatoken=x",
+	}
+	if got := resumeCheckpoint(graph); got != graph.GraphDeltaLink {
+		t.Fatalf("graph checkpoint = %q, want the stored link", got)
+	}
+
+	legacyIMAP := &models.EmailIntakeState{LastUID: 480, UIDValidity: 100}
+	if got := resumeCheckpoint(legacyIMAP); got != "imap-v1:100:480" {
+		t.Fatalf("legacy IMAP checkpoint = %q, want the watermark encoded for the mailbox", got)
+	}
+
+	if got := resumeCheckpoint(&models.EmailIntakeState{}); got != "" {
+		t.Fatalf("empty state = %q, want no checkpoint", got)
+	}
+}

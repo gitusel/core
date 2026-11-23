@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"windshift/internal/blobstore"
 	"windshift/internal/database"
 	"windshift/internal/email"
+	"windshift/internal/mailbox"
 	"windshift/internal/models"
 	"windshift/internal/repository"
 	"windshift/internal/services"
@@ -361,9 +363,9 @@ func (es *EmailScheduler) processChannel(ctx context.Context, ch channelInfo) bo
 		}
 	}
 
-	client, err := provider.Connect(ctx, decryptedConfig)
+	client, err := openMailbox(ctx, provider, decryptedConfig)
 	if err != nil {
-		slog.Error("failed to connect to IMAP", "channel_id", ch.ID, "error", err)
+		slog.Error("failed to open mailbox", "channel_id", ch.ID, "error", err)
 		es.recordError(ctx, ch.ID, err)
 		return false
 	}
@@ -437,12 +439,52 @@ func legacyIntakeFromConfig(config *models.ChannelConfig) *models.Intake {
 	}
 }
 
+// mailboxUID reports the IMAP UID the mailbox has committed, or 0 for a
+// transport without a UID space. It is used only for the numeric watermark the
+// legacy schema still carries.
+func mailboxUID(client mailbox.Mailbox) uint32 {
+	if withUID, ok := client.(interface{ CommittedUID() uint32 }); ok {
+		return withUID.CommittedUID()
+	}
+	return 0
+}
+
+// resumeCheckpoint returns the cursor to restore for an intake.
+//
+// Graph stores its opaque link in graph_delta_link. IMAP stores numeric columns,
+// and rows written before this refactor have no encoded cursor at all, so the
+// watermark is re-encoded here; without that every IMAP intake would refetch
+// from UID 0 after a restart.
+func resumeCheckpoint(state *models.EmailIntakeState) string {
+	if state == nil {
+		return ""
+	}
+	if link := strings.TrimSpace(state.GraphDeltaLink); link != "" {
+		return link
+	}
+	return email.EncodeIMAPCheckpoint(state.UIDValidity, uint32(state.LastUID)) //nolint:gosec // bounded by UID constraints
+}
+
+// openMailbox resolves a provider to a pollable mailbox. A provider that speaks
+// a native transport (Graph today, Teams later) opens one directly; an
+// IMAP-backed provider is wrapped from its client.
+func openMailbox(ctx context.Context, provider email.Provider, config *models.ChannelConfig) (mailbox.Mailbox, error) {
+	if mp, ok := provider.(mailbox.Provider); ok {
+		return mp.OpenMailbox(ctx, config)
+	}
+	client, err := provider.Connect(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return email.NewIMAPMailbox(client), nil
+}
+
 // pollIntake selects one folder and processes new mail with the intake's
 // routing. The watermark advances independently per intake.
 func (es *EmailScheduler) pollIntake(
 	ctx context.Context,
 	ch channelInfo,
-	client email.IMAPClient,
+	client mailbox.Mailbox,
 	base *models.ChannelConfig,
 	intake *models.Intake,
 ) error {
@@ -465,91 +507,123 @@ func (es *EmailScheduler) pollIntake(
 		effective.EmailProcessingDisposition = intake.ProcessingDisposition
 	}
 
-	mailbox := intake.Folder
-	if mailbox == "" {
-		mailbox = "INBOX"
+	folder := intake.Folder
+	if folder == "" {
+		folder = "INBOX"
 	}
 
-	selectData, err := client.SelectMailbox(mailbox)
+	// A brand-new intake starts at the end of the mailbox unless the operator
+	// explicitly opted into importing its existing mail. Without this a mailbox
+	// with years of history turns into years of tickets.
+	firstPoll := state.UIDValidity == 0 && state.LastUID == 0
+	skipExisting := firstPoll && !intake.ImportExistingMail
+
+	info, err := client.Open(ctx, folder, skipExisting)
 	if err != nil {
-		slog.Error("failed to select mailbox",
-			"channel_id", ch.ID, "intake_id", intake.ID, "mailbox", mailbox, "error", err)
+		slog.Error("failed to open mailbox",
+			"channel_id", ch.ID, "intake_id", intake.ID, "mailbox", folder, "error", err)
 		return err
 	}
-	if store, ok := client.(email.GraphDeltaStore); ok {
-		store.RestoreGraphDelta(state.GraphDeltaLink)
-	}
-	if reset, ok := client.(email.GraphCursorControl); ok && reset.GraphFolderMismatch() {
-		// The intake folder changed and the repository still holds the previous
-		// folder's delta link. Resume would keep polling the old folder.
-		state.UIDValidity = 0
-		state.LastUID = 0
-		state.GraphDeltaLink = ""
-	}
-	currentValidity := selectData.UIDValidity
-	sinceUID := uint32(state.LastUID) //nolint:gosec // bounded by IMAP UID constraints
-	if state.UIDValidity != 0 && state.UIDValidity != currentValidity {
-		slog.Warn("UIDVALIDITY changed, resetting LastUID to refetch the mailbox",
+	// Restore after Open: selecting a folder resets a per-folder cursor, so the
+	// intake's own checkpoint must be applied to the folder it just opened.
+	client.Restore(resumeCheckpoint(state))
+
+	// Open reports the transport's cursor generation. For IMAP a change means
+	// the server renumbered the mailbox, so watermarks and dedup keys from the
+	// old UID space must not be reused.
+	currentValidity := info.Validity
+	if state.UIDValidity != 0 && currentValidity != 0 && state.UIDValidity != currentValidity {
+		slog.Warn("mailbox UIDVALIDITY changed, resetting watermarks",
 			"channel_id", ch.ID,
 			"intake_id", intake.ID,
 			"old_validity", state.UIDValidity,
 			"new_validity", currentValidity,
 		)
-		sinceUID = 0
+		state.LastUID = 0
+		state.FailedMessageUID = 0
+		state.FailedMessageUIDValidity = 0
+		state.FailedMessageCount = 0
+		state.GraphDeltaLink = ""
 	}
-
-	// A brand-new intake starts at the current UIDNEXT unless the operator
-	// explicitly opted into importing the mailbox's existing mail. Without this
-	// a mailbox with years of history turns into years of tickets.
-	firstPoll := state.UIDValidity == 0 && state.LastUID == 0
-	skipExisting := firstPoll && !intake.ImportExistingMail && selectData.UIDNext > 0
-	if skipExisting {
-		sinceUID = uint32(selectData.UIDNext) - 1
-	}
+	state.UIDValidity = currentValidity
 
 	es.mu.RLock()
 	batchSize := es.batchSize
 	es.mu.RUnlock()
+
 	if skipExisting {
-		if primer, ok := client.(email.GraphBaselineSync); ok {
-			done, primeErr := primer.EstablishBaseline(ctx, batchSize)
-			if primeErr != nil {
-				slog.Error("failed to establish graph delta baseline",
-					"channel_id", ch.ID, "intake_id", intake.ID, "error", primeErr)
-				return primeErr
+		// A transport with a seedable cursor establishes its baseline; one that
+		// starts after UIDNEXT already did so inside Open.
+		{
+			if seeder, ok := client.(mailbox.Seeder); ok {
+				// Graph has no UIDNEXT to jump to, so the cutoff is established
+				// by acknowledging the folder's current delta state.
+				done, primeErr := seeder.Seed(ctx, batchSize)
+				if primeErr != nil {
+					slog.Error("failed to establish graph delta baseline",
+						"channel_id", ch.ID, "intake_id", intake.ID, "error", primeErr)
+					return primeErr
+				}
+				if err := es.commitGraphBaseline(ctx, ch, intake, client, done); err != nil {
+					slog.Error("failed to store graph baseline", "channel_id", ch.ID, "intake_id", intake.ID, "error", err)
+					return err
+				}
+				if !done {
+					// A multi-page baseline needs another tick.
+					return nil
+				}
 			}
-			// The final deltaLink and the initialized validity must land
-			// together. Saving the link first and crashing before validity
-			// leaves the next tick in baseline mode, which would discard mail
-			// that arrived after that link.
-			if err := es.commitGraphBaseline(ctx, ch, intake, client, done, currentValidity); err != nil {
-				slog.Error("failed to store graph baseline", "channel_id", ch.ID, "intake_id", intake.ID, "error", err)
-				return err
-			}
-			return nil
 		}
 	}
-	if ctrl, ok := client.(email.GraphCursorControl); ok {
-		ctrl.OmitExhaustedPoison(maxDeliveryAttempts)
+
+	if poisoner, ok := client.(mailbox.Poisoner); ok {
+		poisoner.OmitExhausted(maxDeliveryAttempts)
 	}
-	messages, err := client.FetchMessages(sinceUID, batchSize)
+
+	deliveries, err := client.Fetch(ctx, batchSize)
 	if err != nil {
 		slog.Error("failed to fetch messages", "channel_id", ch.ID, "intake_id", intake.ID, "error", err)
 		return err
 	}
-	if len(messages) == 0 {
-		if skipExisting {
-			es.updatePollState(ctx, ch, intake, int(sinceUID), currentValidity, 0, 0, 0)
-		} else {
-			es.updatePollLastChecked(ctx, ch, intake, currentValidity)
+	messages := make([]*email.FetchedMessage, 0, len(deliveries))
+	refs := make([]string, 0, len(deliveries))
+	for i, d := range deliveries {
+		msg := &email.FetchedMessage{}
+		if d.Message != nil {
+			msg.Raw = d.Message.Raw
+			msg.FetchError = d.Message.FetchError
 		}
+		// IMAP refs are the decimal UID, so this preserves the UID for the
+		// parser and for dedup. A non-IMAP transport has no UID; the ordinal is
+		// only for logging and is never persisted.
+		if uid, convErr := strconv.ParseUint(d.Ref, 10, 32); convErr == nil {
+			msg.UID = uint32(uid)
+		} else {
+			msg.UID = uint32(i + 1) //nolint:gosec // batch-local ordinal
+		}
+		messages = append(messages, msg)
+		refs = append(refs, d.Ref)
+	}
+	refOf := func(index int) string {
+		if index >= 0 && index < len(refs) {
+			return refs[index]
+		}
+		return ""
+	}
+
+	if len(messages) == 0 {
+		client.Acknowledge()
+		// Persist the post-skip position even with nothing to process: a first
+		// poll that skipped existing history has moved the cursor, and losing
+		// that would re-import the mailbox on the next tick.
+		es.updatePollState(ctx, ch, intake, int(mailboxUID(client)), state.UIDValidity, 0, 0, 0)
 		es.commitGraphDelta(ctx, ch, intake, client)
 		return nil
 	}
 
 	slog.Info("fetched new emails", "channel_id", ch.ID, "intake_id", intake.ID, "count", len(messages))
 
-	maxUID := sinceUID
+	maxUID := uint32(state.LastUID) //nolint:gosec // bounded by IMAP UID constraints
 	processedCount := 0
 	rateLimitedCount := 0
 	errorCount := 0
@@ -558,7 +632,8 @@ func (es *EmailScheduler) pollIntake(
 	deferredClaim := false
 	stoppedEarly := false
 	disposition := email.ResolveEmailDisposition(&effective)
-	for _, msg := range messages {
+	for i, msg := range messages {
+		ref := refOf(i)
 		if ctx.Err() != nil {
 			// The per-mailbox budget expired between messages. Stop cleanly so
 			// the watermark covers everything already processed instead of
@@ -567,7 +642,7 @@ func (es *EmailScheduler) pollIntake(
 			break
 		}
 		if msg.FetchError != nil {
-			if id, _, exhausted := noteGraphPoison(client, msg.UID); exhausted {
+			if id, _, exhausted := notePoison(client, ref); exhausted {
 				slog.Error("dropping poison graph message after repeated fetch failures; continuing so later mail on this delta page is not skipped",
 					"channel_id", ch.ID, "intake_id", intake.ID, "uid", msg.UID, "graph_id", id, "error", msg.FetchError)
 				state.FailedMessageUID = 0
@@ -587,7 +662,7 @@ func (es *EmailScheduler) pollIntake(
 		// A synthetic legacy intake (ID 0) is channel-scoped: the processor
 		// leaves the tracking row's intake_id NULL so channel-level rate-limit
 		// requeue still finds it.
-		result, processErr := es.processor.ProcessEmailWithIntake(ctx, parsed, ch.ID, currentValidity, &effective, intake)
+		result, processErr := es.processor.ProcessEmailWithIntake(ctx, parsed, ch.ID, state.UIDValidity, &effective, intake)
 		if processErr != nil {
 			if ctx.Err() != nil {
 				// The budget expired inside the message. Leave the cursor before
@@ -595,7 +670,7 @@ func (es *EmailScheduler) pollIntake(
 				stoppedEarly = true
 				break
 			}
-			if id, _, exhausted := noteGraphPoison(client, msg.UID); exhausted {
+			if id, _, exhausted := notePoison(client, ref); exhausted {
 				slog.Error("dropping poison graph message after repeated failures; continuing so later mail on this delta page is not skipped",
 					"channel_id", ch.ID, "intake_id", intake.ID, "uid", msg.UID, "graph_id", id, "error", processErr)
 				state.FailedMessageUID = 0
@@ -638,11 +713,11 @@ func (es *EmailScheduler) pollIntake(
 		if !rateLimited {
 			switch disposition {
 			case models.EmailDispositionMarkRead:
-				if markErr := client.MarkAsRead(msg.UID); markErr != nil {
+				if markErr := client.MarkRead(ctx, ref); markErr != nil {
 					slog.Warn("failed to mark email as read", "uid", msg.UID, "error", markErr)
 				}
 			case models.EmailDispositionDelete:
-				if delErr := client.DeleteMessage(msg.UID); delErr != nil {
+				if delErr := client.Delete(ctx, ref); delErr != nil {
 					slog.Warn("failed to delete email", "uid", msg.UID, "error", delErr)
 				}
 			}
@@ -660,7 +735,7 @@ func (es *EmailScheduler) pollIntake(
 	}
 
 	if disposition == models.EmailDispositionDelete && processedCount > 0 {
-		if expErr := client.Expunge(); expErr != nil {
+		if expErr := client.Expunge(ctx); expErr != nil {
 			slog.Warn("failed to expunge deleted messages", "error", expErr)
 		}
 	}
@@ -673,7 +748,7 @@ func (es *EmailScheduler) pollIntake(
 	failedUID, failedValidity, failedCount := 0, uint32(0), 0
 	if errorCount > 0 {
 		failedUID, failedValidity, failedCount = nextFailedMessageAttempt(
-			state.FailedMessageUID, state.FailedMessageUIDValidity, state.FailedMessageCount, offenderUID, currentValidity)
+			state.FailedMessageUID, state.FailedMessageUIDValidity, state.FailedMessageCount, offenderUID, state.UIDValidity)
 		if failedCount >= maxDeliveryAttempts {
 			slog.Error("dropping poison email after repeated failures; advancing past it",
 				"channel_id", ch.ID, "intake_id", intake.ID, "uid", offenderUID,
@@ -687,14 +762,20 @@ func (es *EmailScheduler) pollIntake(
 		}
 	}
 
-	es.updatePollState(ctx, ch, intake, int(maxUID), currentValidity, failedUID, failedValidity, failedCount)
 	if !stoppedEarly {
-		if ctrl, ok := client.(email.GraphCursorControl); ok {
-			ctrl.AcceptGraphPage()
-		}
+		client.Acknowledge()
+	}
+	// The mailbox is the authority on its own cursor: IMAP reports the last
+	// acknowledged UID, a Graph-compatible client reports none (its resume link
+	// lives in the checkpoint column).
+	if uid := mailboxUID(client); uid > 0 {
+		maxUID = uid
+	}
+	es.updatePollState(ctx, ch, intake, int(maxUID), state.UIDValidity, failedUID, failedValidity, failedCount)
+	if !stoppedEarly {
 		es.commitGraphDelta(ctx, ch, intake, client)
-	} else if ctrl, ok := client.(email.GraphCursorControl); ok {
-		if _, _, poisoned := ctrl.Poison(); poisoned {
+	} else if poisoner, ok := client.(mailbox.Poisoner); ok {
+		if _, _, poisoned := poisoner.Poison(); poisoned {
 			es.commitGraphDelta(ctx, ch, intake, client)
 		}
 	}
@@ -717,35 +798,36 @@ func (es *EmailScheduler) pollIntake(
 // restart every poll, so they must not identify poison or missing-Message-ID
 // mail. exhausted means this id has failed enough times to skip while the
 // rest of the page is still processed.
-func noteGraphPoison(client email.IMAPClient, uid uint32) (id string, count int, exhausted bool) {
-	ctrl, ok := client.(email.GraphCursorControl)
+// notePoison records a failed delivery by its transport-stable ref. A ref is
+// only meaningful for a transport with poison tracking; an IMAP mailbox pins
+// the failure on failed_message_uid instead, so this is a no-op there.
+func notePoison(client mailbox.Mailbox, ref string) (id string, count int, exhausted bool) {
+	if ref == "" {
+		return "", 0, false
+	}
+	poisoner, ok := client.(mailbox.Poisoner)
 	if !ok {
 		return "", 0, false
 	}
-	id, ok = ctrl.GraphMessageID(uid)
-	if !ok || id == "" {
-		return "", 0, false
-	}
 	count = 1
-	if prev, n, ok := ctrl.Poison(); ok && prev == id {
+	if prev, n, ok := poisoner.Poison(); ok && prev == ref {
 		count = n + 1
 	}
 	if count >= maxDeliveryAttempts {
-		return id, count, true
+		return ref, count, true
 	}
-	ctrl.SetGraphPoison(id, count)
-	return id, count, false
+	poisoner.SetPoison(ref, count)
+	return ref, count, false
 }
 
 // commitGraphBaseline stores a baseline page. A finished round writes the
 // resume link and the initialized validity in one update. An unfinished round
 // writes only the nextLink so the next tick keeps priming.
-func (es *EmailScheduler) commitGraphBaseline(ctx context.Context, ch channelInfo, intake *models.Intake, client email.IMAPClient, done bool, uidValidity uint32) error {
-	store, ok := client.(email.GraphDeltaStore)
-	if !ok || intake == nil || intake.ID <= 0 {
+func (es *EmailScheduler) commitGraphBaseline(ctx context.Context, ch channelInfo, intake *models.Intake, client mailbox.Mailbox, done bool) error {
+	if intake == nil || intake.ID <= 0 {
 		return nil
 	}
-	link := strings.TrimSpace(store.GraphDelta())
+	link := strings.TrimSpace(client.Checkpoint())
 	if link == "" {
 		return fmt.Errorf("graph baseline did not produce a resume link")
 	}
@@ -755,11 +837,11 @@ func (es *EmailScheduler) commitGraphBaseline(ctx context.Context, ch channelInf
 	if done {
 		_, err = es.db.ExecWriteContext(persistCtx, `
 			UPDATE email_intake_state
-			SET graph_delta_link = ?, uid_validity = ?, last_uid = 0,
+			SET graph_delta_link = ?, uid_validity = 1, last_uid = 0,
 			    failed_message_uid = 0, failed_message_uid_validity = 0,
 			    failed_message_count = 0, updated_at = CURRENT_TIMESTAMP
 			WHERE intake_id = ?
-		`, link, uidValidity, intake.ID)
+		`, link, intake.ID)
 	} else {
 		_, err = es.db.ExecWriteContext(persistCtx, `
 			UPDATE email_intake_state
@@ -834,12 +916,11 @@ func (es *EmailScheduler) getOrCreateIntakeState(ctx context.Context, intakeID i
 // every fetched message reached a durable outcome. A failed or deferred tick
 // leaves the previous link in place so the next poll retries it. An empty
 // link is not written: that would wipe a saved cursor and re-read the folder.
-func (es *EmailScheduler) commitGraphDelta(ctx context.Context, ch channelInfo, intake *models.Intake, client email.IMAPClient) {
-	store, ok := client.(email.GraphDeltaStore)
-	if !ok || intake.ID <= 0 {
+func (es *EmailScheduler) commitGraphDelta(ctx context.Context, ch channelInfo, intake *models.Intake, client mailbox.Mailbox) {
+	if intake.ID <= 0 {
 		return
 	}
-	link := strings.TrimSpace(store.GraphDelta())
+	link := strings.TrimSpace(client.Checkpoint())
 	if link == "" {
 		return
 	}

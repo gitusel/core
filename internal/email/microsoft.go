@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 
+	"windshift/internal/mailbox"
 	"windshift/internal/models"
 )
 
@@ -141,11 +142,33 @@ func (p *MicrosoftProvider) RefreshToken(ctx context.Context, refreshToken strin
 	return tokens, nil
 }
 
-// Connect opens the mailbox through Microsoft Graph. It does not dial IMAP.
-// An Outlook-audience access token is refused before any Graph call so a
+// OpenMailbox connects the configured mailbox through Microsoft Graph and
+// returns it as a transport-neutral Mailbox. No IMAP client is involved: Graph
+// mail is resumed from a delta link, not from a UID watermark.
+//
+// An Outlook-audience access token is refused before any Graph call, so a
 // legacy IMAP grant cannot look like a configured mailbox that never receives
 // mail. Reauthorize the mailbox; refresh cannot migrate that grant.
-func (p *MicrosoftProvider) Connect(ctx context.Context, config *models.ChannelConfig) (IMAPClient, error) {
+func (p *MicrosoftProvider) OpenMailbox(ctx context.Context, config *models.ChannelConfig) (mailbox.Mailbox, error) {
+	box, err := p.openGraphMailbox(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return NewGraphMailbox(box), nil
+}
+
+// Connect refuses to present Graph mail as an IMAP client.
+//
+// The Provider interface keeps Connect because IMAP-backed providers need it,
+// but Graph has no UID space to select or fetch by. Callers must use
+// OpenMailbox; returning an adapter that fabricates SelectData and per-poll
+// UIDs is what this replaces.
+func (p *MicrosoftProvider) Connect(context.Context, *models.ChannelConfig) (IMAPClient, error) {
+	return nil, fmt.Errorf("microsoft Graph mailboxes are opened through MailboxProvider.OpenMailbox, not an IMAP client")
+}
+
+// openGraphMailbox validates the delegated grant and builds the Graph reader.
+func (p *MicrosoftProvider) openGraphMailbox(ctx context.Context, config *models.ChannelConfig) (*GraphMailbox, error) {
 	mailbox := strings.TrimSpace(config.EmailOAuthEmail)
 	if mailbox == "" {
 		mailbox = strings.TrimSpace(config.EmailOAuthMailbox)
@@ -159,33 +182,30 @@ func (p *MicrosoftProvider) Connect(ctx context.Context, config *models.ChannelC
 	if err := microsoftGrantRequiresReauthorization(config.EmailOAuthAccessToken); err != nil {
 		return nil, err
 	}
-	box, err := OpenGraphMailbox(ctx, GraphMailboxConfig{
+	return OpenGraphMailbox(ctx, GraphMailboxConfig{
 		BaseURL:    p.graphBaseURL,
 		Token:      config.EmailOAuthAccessToken,
 		Mailbox:    mailbox,
 		HTTPClient: p.httpClient,
 	})
-	if err != nil {
-		return nil, err
-	}
-	return &graphMailboxIMAP{box: box, ctx: ctx}, nil
 }
 
 // TestConnection checks the delegated Graph token and that the configured
 // folder exists. It does not dial IMAP. A missing folder is an error, not an
 // empty mailbox.
 func (p *MicrosoftProvider) TestConnection(ctx context.Context, config *models.ChannelConfig) error {
-	client, err := p.Connect(ctx, config)
+	box, err := p.openGraphMailbox(ctx, config)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = client.Close() }()
 	folder := strings.TrimSpace(config.EmailMailbox)
 	if folder == "" {
 		folder = "INBOX"
 	}
-	_, err = client.SelectMailbox(folder)
-	return err
+	// SelectFolder only maps well-known names locally; validating connection
+	// requires confirming the folder exists in the mailbox, which bindFolder
+	// does with a real Graph call and a not-found error.
+	return box.bindFolder(ctx, folder)
 }
 
 func microsoftGraphScopes(scopes []string) []string {

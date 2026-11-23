@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"windshift/internal/mailbox"
+	"windshift/internal/mailmsg"
 	"windshift/internal/models"
 )
 
@@ -60,36 +62,36 @@ func TestGraphDeltaReplayKeepsCursorUntilMIMESucceeds(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	client := openGraphTestClient(t, srv, token, mailbox)
-	if _, err := client.SelectMailbox("INBOX"); err != nil {
-		t.Fatalf("SelectMailbox: %v", err)
+	if _, err := client.Open(context.Background(), "INBOX", false); err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	client.(GraphDeltaStore).RestoreGraphDelta(srv.URL + saved)
+	client.Restore(srv.URL + saved)
 
-	if _, err := client.FetchMessages(0, 2); err == nil {
+	if _, err := graphFetch(client, 2); err == nil {
 		t.Fatal("failed MIME fetch succeeded")
 	}
-	if got := graphResumeURL(client.(GraphDeltaStore).GraphDelta()); got != srv.URL+saved {
+	if got := graphResumeURL(client.Checkpoint()); got != srv.URL+saved {
 		t.Fatalf("cursor after failed tick = %q, want the previous link", got)
 	}
 
 	mu.Lock()
 	mimeFails = false
 	mu.Unlock()
-	messages, err := client.FetchMessages(0, 2)
+	messages, err := graphFetch(client, 2)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if len(messages) != 1 || messages[0].FetchError != nil || !bytesContains(messages[0].Raw, "Replay me") {
 		t.Fatalf("replay messages = %#v", messages)
 	}
-	if got := graphResumeURL(client.(GraphDeltaStore).GraphDelta()); got != srv.URL+next {
+	if got := graphResumeURL(client.Checkpoint()); got != srv.URL+next {
 		t.Fatalf("cursor after success = %q, want advanced link", got)
 	}
 
 	mu.Lock()
 	before := len(calls)
 	mu.Unlock()
-	if _, err := client.FetchMessages(0, 2); err != nil {
+	if _, err := graphFetch(client, 2); err != nil {
 		t.Fatalf("advanced poll: %v", err)
 	}
 	mu.Lock()
@@ -140,27 +142,27 @@ func TestGraphIntakesDoNotShareDeltaCursor(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	client := openGraphTestClient(t, srv, token, mailbox)
-	store := client.(GraphDeltaStore)
-	if _, err := client.SelectMailbox("INBOX"); err != nil {
+	store := client
+	if _, err := client.Open(context.Background(), "INBOX", false); err != nil {
 		t.Fatalf("select inbox: %v", err)
 	}
-	store.RestoreGraphDelta(srv.URL + inboxLink)
-	if _, err := client.FetchMessages(0, 10); err != nil {
+	store.Restore(srv.URL + inboxLink)
+	if _, err := graphFetch(client, 10); err != nil {
 		t.Fatalf("inbox poll: %v", err)
 	}
-	if graphResumeURL(store.GraphDelta()) != srv.URL+inboxNext {
-		t.Fatalf("inbox cursor = %q", store.GraphDelta())
+	if graphResumeURL(store.Checkpoint()) != srv.URL+inboxNext {
+		t.Fatalf("inbox cursor = %q", store.Checkpoint())
 	}
 
 	// The scheduler selects the next intake before restoring that intake's link.
-	if _, err := client.SelectMailbox("Archive"); err != nil {
+	if _, err := client.Open(context.Background(), "Archive", false); err != nil {
 		t.Fatalf("select archive: %v", err)
 	}
-	if store.GraphDelta() != "" {
-		t.Fatalf("archive select kept inbox cursor %q", store.GraphDelta())
+	if store.Checkpoint() != "" {
+		t.Fatalf("archive select kept inbox cursor %q", store.Checkpoint())
 	}
-	store.RestoreGraphDelta(srv.URL + archiveLink)
-	if _, err := client.FetchMessages(0, 10); err != nil {
+	store.Restore(srv.URL + archiveLink)
+	if _, err := graphFetch(client, 10); err != nil {
 		t.Fatalf("archive poll: %v", err)
 	}
 	joined := strings.Join(calls, "\n")
@@ -172,15 +174,15 @@ func TestGraphIntakesDoNotShareDeltaCursor(t *testing.T) {
 	}
 
 	// Two intakes on the same folder still get their own restored link.
-	if _, err := client.SelectMailbox("INBOX"); err != nil {
+	if _, err := client.Open(context.Background(), "INBOX", false); err != nil {
 		t.Fatalf("reselect inbox: %v", err)
 	}
-	if store.GraphDelta() != "" {
-		t.Fatalf("same-folder select kept the previous intake cursor %q", store.GraphDelta())
+	if store.Checkpoint() != "" {
+		t.Fatalf("same-folder select kept the previous intake cursor %q", store.Checkpoint())
 	}
-	store.RestoreGraphDelta(srv.URL + inboxLink)
-	if graphResumeURL(store.GraphDelta()) != srv.URL+inboxLink {
-		t.Fatalf("restore = %q", store.GraphDelta())
+	store.Restore(srv.URL + inboxLink)
+	if graphResumeURL(store.Checkpoint()) != srv.URL+inboxLink {
+		t.Fatalf("restore = %q", store.Checkpoint())
 	}
 }
 
@@ -218,19 +220,19 @@ func TestGraphDeltaRemovedAndReadNoticesAreNotIngested(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	client := openGraphTestClient(t, srv, token, mailbox)
-	if _, err := client.SelectMailbox("INBOX"); err != nil {
-		t.Fatalf("SelectMailbox: %v", err)
+	if _, err := client.Open(context.Background(), "INBOX", false); err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	client.(GraphDeltaStore).RestoreGraphDelta(srv.URL + saved)
-	messages, err := client.FetchMessages(0, 10)
+	client.Restore(srv.URL + saved)
+	messages, err := graphFetch(client, 10)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 	if len(messages) != 1 || messages[0].FetchError != nil || !bytesContains(messages[0].Raw, "New mail") {
 		t.Fatalf("messages = %#v, want only the created message", messages)
 	}
-	if graphResumeURL(client.(GraphDeltaStore).GraphDelta()) != srv.URL+advanced {
-		t.Fatalf("cursor = %q, want the page deltaLink", client.(GraphDeltaStore).GraphDelta())
+	if graphResumeURL(client.Checkpoint()) != srv.URL+advanced {
+		t.Fatalf("cursor = %q, want the page deltaLink", client.Checkpoint())
 	}
 	joined := strings.Join(calls, "\n")
 	for _, id := range []string{"AAMk-deleted", "AAMk-moved", "AAMk-read"} {
@@ -330,15 +332,15 @@ func TestGraphPollHonorsSchedulerCancellation(t *testing.T) {
 	box := openGraphTestBox(t, srv, "token", "box")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	client := &graphMailboxIMAP{box: box, ctx: ctx}
-	if _, err := client.FetchMessages(0, 2); !errors.Is(err, context.Canceled) {
-		t.Fatalf("FetchMessages err = %v, want context canceled", err)
+	client := NewGraphMailbox(box)
+	if _, err := graphFetchCtx(ctx, client, 2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Fetch err = %v, want context canceled", err)
 	}
 	if calls != 0 {
 		t.Fatalf("canceled poll made %d Graph calls", calls)
 	}
-	if client.GraphDelta() != "" {
-		t.Fatalf("canceled poll advanced cursor to %q", client.GraphDelta())
+	if client.Checkpoint() != "" {
+		t.Fatalf("canceled poll advanced cursor to %q", client.Checkpoint())
 	}
 }
 
@@ -392,12 +394,12 @@ func TestMicrosoftIMAPGrantIsNotPolledAsGraph(t *testing.T) {
 
 	provider.graphBaseURL = srv.URL
 	provider.httpClient = srv.Client()
-	_, err = provider.Connect(context.Background(), &models.ChannelConfig{
+	_, err = provider.OpenMailbox(context.Background(), &models.ChannelConfig{
 		EmailOAuthAccessToken: graphTestJWT("https://outlook.office365.com", "IMAP.AccessAsUser.All"),
 		EmailOAuthEmail:       "box@contoso.example",
 	})
 	if err == nil || !strings.Contains(err.Error(), "reauthorize the mailbox for Microsoft Graph Mail.ReadWrite") {
-		t.Fatalf("Connect = %v", err)
+		t.Fatalf("OpenMailbox = %v", err)
 	}
 	if calls != 0 {
 		t.Fatalf("Outlook grant was sent to Graph (%d calls)", calls)
@@ -424,14 +426,14 @@ func TestGraphReadUpdateDoesNotMarkReadAgain(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	client := openGraphTestClient(t, srv, "token", "box")
-	if _, err := client.SelectMailbox("INBOX"); err != nil {
-		t.Fatalf("SelectMailbox: %v", err)
+	if _, err := client.Open(context.Background(), "INBOX", false); err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	messages, err := client.FetchMessages(0, 2)
+	messages, err := graphFetch(client, 2)
 	if err != nil || len(messages) != 1 {
 		t.Fatalf("fetch = (%d, %v)", len(messages), err)
 	}
-	if err := client.MarkAsRead(messages[0].UID); err != nil {
+	if err := client.MarkRead(context.Background(), messages[0].Ref); err != nil {
 		t.Fatalf("MarkAsRead: %v", err)
 	}
 	if strings.Contains(strings.Join(calls, "\n"), "PATCH") {
@@ -504,17 +506,17 @@ func openGraphTestBox(t *testing.T, srv *httptest.Server, token, mailbox string)
 	return box
 }
 
-func openGraphTestClient(t *testing.T, srv *httptest.Server, token, mailbox string) IMAPClient {
+func openGraphTestClient(t *testing.T, srv *httptest.Server, token, mailboxAddr string) mailbox.Mailbox {
 	t.Helper()
 	provider := NewMicrosoftProvider("client", "secret", "tenant", nil)
 	provider.graphBaseURL = srv.URL
 	provider.httpClient = srv.Client()
-	client, err := provider.Connect(context.Background(), &models.ChannelConfig{
+	client, err := provider.OpenMailbox(context.Background(), &models.ChannelConfig{
 		EmailOAuthAccessToken: token,
-		EmailOAuthEmail:       mailbox,
+		EmailOAuthEmail:       mailboxAddr,
 	})
 	if err != nil {
-		t.Fatalf("Connect: %v", err)
+		t.Fatalf("OpenMailbox: %v", err)
 	}
 	return client
 }
@@ -555,10 +557,10 @@ func TestGraphBaselineReadUpdateDoesNotIngestHistoricalMail(t *testing.T) {
 	t.Cleanup(srv.Close)
 	phase = "baseline"
 	client := openGraphTestClient(t, srv, token, "box")
-	if _, err := client.SelectMailbox("INBOX"); err != nil {
-		t.Fatalf("SelectMailbox: %v", err)
+	if _, err := client.Open(context.Background(), "INBOX", false); err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	done, err := client.(GraphBaselineSync).EstablishBaseline(context.Background(), 10)
+	done, err := client.(mailbox.Seeder).Seed(context.Background(), 10)
 	if err != nil || !done {
 		t.Fatalf("baseline = (%v, %v)", done, err)
 	}
@@ -569,7 +571,7 @@ func TestGraphBaselineReadUpdateDoesNotIngestHistoricalMail(t *testing.T) {
 	}
 	phase = "incremental"
 	calls = nil
-	messages, err := client.FetchMessages(0, 10)
+	messages, err := graphFetch(client, 10)
 	if err != nil {
 		t.Fatalf("incremental poll: %v", err)
 	}
@@ -597,15 +599,15 @@ func TestGraphFolderChangeDropsPreviousDeltaLink(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	client := openGraphTestClient(t, srv, token, "box")
-	if _, err := client.SelectMailbox("Archive"); err != nil {
-		t.Fatalf("SelectMailbox: %v", err)
+	if _, err := client.Open(context.Background(), "Archive", false); err != nil {
+		t.Fatalf("Open: %v", err)
 	}
 	stale := "ws-graph-v1\nfolder=inbox\n" + srv.URL + inboxLink
-	client.(GraphDeltaStore).RestoreGraphDelta(stale)
-	if !client.(GraphCursorControl).GraphFolderMismatch() {
+	client.Restore(stale)
+	if !client.(interface{ FolderMismatch() bool }).FolderMismatch() {
 		t.Fatal("folder change reused the previous folder checkpoint")
 	}
-	if _, err := client.FetchMessages(0, 2); err != nil {
+	if _, err := graphFetch(client, 2); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
 	joined := strings.Join(calls, "\n")
@@ -633,16 +635,16 @@ func TestGraphPoisonCheckpointKeepsResumeURL(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	client := openGraphTestClient(t, srv, token, "box")
-	if _, err := client.SelectMailbox("INBOX"); err != nil {
-		t.Fatalf("SelectMailbox: %v", err)
+	if _, err := client.Open(context.Background(), "INBOX", false); err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	client.(GraphDeltaStore).RestoreGraphDelta(srv.URL + saved)
-	if _, err := client.FetchMessages(0, 2); err == nil {
+	client.Restore(srv.URL + saved)
+	if _, err := graphFetch(client, 2); err == nil {
 		t.Fatal("expected MIME failure")
 	}
-	ctrl := client.(GraphCursorControl)
-	ctrl.SetGraphPoison("AAMk-bad", 2)
-	held := client.(GraphDeltaStore).GraphDelta()
+	ctrl := client.(mailbox.Poisoner)
+	ctrl.SetPoison("AAMk-bad", 2)
+	held := client.Checkpoint()
 	if graphResumeURL(held) != srv.URL+saved {
 		t.Fatalf("poison checkpoint URL = %q, want the previous link", graphResumeURL(held))
 	}
@@ -670,6 +672,27 @@ func TestGraphFallbackMessageIDFollowsGraphID(t *testing.T) {
 
 func srvSafe(r *http.Request) string {
 	return "http://" + r.Host
+}
+
+// graphFetch pulls one round and acknowledges it. Tests that exercise an
+// early exit deliberately call Fetch without the acknowledge.
+func graphFetch(mb mailbox.Mailbox, batch int) ([]*mailmsg.Message, error) {
+	return graphFetchCtx(context.Background(), mb, batch)
+}
+
+func graphFetchCtx(ctx context.Context, mb mailbox.Mailbox, batch int) ([]*mailmsg.Message, error) {
+	deliveries, err := mb.Fetch(ctx, batch)
+	if err != nil {
+		return nil, err
+	}
+	// Tests exercise the committed state; the scheduler acknowledges a batch it
+	// fully processed. Early-exit tests call Fetch directly instead.
+	mb.Acknowledge()
+	messages := make([]*mailmsg.Message, 0, len(deliveries))
+	for _, d := range deliveries {
+		messages = append(messages, d.Message)
+	}
+	return messages, nil
 }
 
 func graphResumeURL(link string) string {

@@ -13,8 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
-
 	"windshift/internal/mailmsg"
 	"windshift/internal/utils"
 )
@@ -60,6 +58,10 @@ type GraphMailbox struct {
 	http      *http.Client
 	idsByUID  map[uint32]string
 	readByUID map[uint32]bool
+	// readByID records which messages the last PollMessages round reported as
+	// already read, keyed by Graph id. MarkRead on one of those would be a
+	// redundant PATCH and can race a concurrent reader.
+	readByID map[string]bool
 }
 
 // OpenGraphMailbox builds a Graph mailbox reader. It does not call Graph.
@@ -473,9 +475,14 @@ func (b *GraphMailbox) PollMessagesSince(ctx context.Context, cursor GraphMailbo
 		return nil, cursor, err
 	}
 	messages := make([]*mailmsg.Message, 0, len(fetched))
+	read := make(map[string]bool, len(fetched))
 	for _, f := range fetched {
 		messages = append(messages, &mailmsg.Message{Ref: f.Ref, Raw: f.Raw, FetchError: f.Err})
+		if f.IsRead {
+			read[f.Ref] = true
+		}
 	}
+	b.readByID = read
 	return messages, next, nil
 }
 
@@ -802,178 +809,6 @@ func readBounded(r io.Reader, limit int64) ([]byte, error) {
 	}
 	return data, nil
 }
-
-// graphMailboxIMAP lets the existing poller consume Graph mail without dialing IMAP.
-type graphMailboxIMAP struct {
-	box            *GraphMailbox
-	ctx            context.Context
-	folder         string
-	cursor         GraphMailboxCursor
-	checkpoint     graphCheckpoint
-	pendingURL     string
-	holdResume     bool
-	folderMismatch bool
-	omitPoison     string
-	ids            map[uint32]string
-	alreadyRead    map[uint32]bool
-}
-
-func (g *graphMailboxIMAP) opCtx() context.Context {
-	if g.ctx != nil {
-		return g.ctx
-	}
-	return context.Background()
-}
-
-func (g *graphMailboxIMAP) SelectMailbox(name string) (*imap.SelectData, error) {
-	g.cursor = GraphMailboxCursor{}
-	g.pendingURL = ""
-	g.holdResume = false
-	g.omitPoison = ""
-	g.ids = nil
-	g.alreadyRead = nil
-	if err := g.box.bindFolder(g.opCtx(), name); err != nil {
-		return nil, err
-	}
-	g.folder = g.box.folder
-	return &imap.SelectData{UIDValidity: 1, UIDNext: 1}, nil
-}
-
-func (g *graphMailboxIMAP) RestoreGraphDelta(link string) {
-	cp := parseGraphCheckpoint(link)
-	g.folderMismatch = cp.Folder != "" && g.folder != "" && cp.Folder != g.folder
-	g.pendingURL = ""
-	g.holdResume = false
-	g.omitPoison = ""
-	if g.folderMismatch {
-		g.checkpoint = graphCheckpoint{Folder: g.folder}
-		g.cursor = GraphMailboxCursor{}
-		return
-	}
-	if cp.Folder == "" {
-		cp.Folder = g.folder
-	}
-	g.checkpoint = cp
-	g.cursor = GraphMailboxCursor{DeltaLink: cp.URL}
-}
-
-func (g *graphMailboxIMAP) GraphDelta() string {
-	cp := g.checkpoint
-	cp.Folder = g.folder
-	if g.holdResume {
-		cp.URL = g.checkpoint.URL
-	} else if g.pendingURL != "" {
-		cp.URL = g.pendingURL
-		cp.PoisonID = ""
-		cp.PoisonCount = 0
-	} else {
-		cp.URL = g.cursor.DeltaLink
-	}
-	if strings.TrimSpace(cp.URL) == "" {
-		return ""
-	}
-	return encodeGraphCheckpoint(cp)
-}
-
-func (g *graphMailboxIMAP) GraphFolderMismatch() bool { return g.folderMismatch }
-
-func (g *graphMailboxIMAP) GraphMessageID(uid uint32) (string, bool) {
-	id := g.ids[uid]
-	return id, id != ""
-}
-
-func (g *graphMailboxIMAP) Poison() (string, int, bool) {
-	if g.checkpoint.PoisonID == "" {
-		return "", 0, false
-	}
-	return g.checkpoint.PoisonID, g.checkpoint.PoisonCount, true
-}
-
-func (g *graphMailboxIMAP) SetGraphPoison(id string, count int) {
-	g.checkpoint.PoisonID = id
-	g.checkpoint.PoisonCount = count
-	g.holdResume = true
-}
-
-func (g *graphMailboxIMAP) OmitExhaustedPoison(max int) {
-	if max > 0 && g.checkpoint.PoisonCount >= max && g.checkpoint.PoisonID != "" {
-		g.omitPoison = g.checkpoint.PoisonID
-	}
-}
-
-func (g *graphMailboxIMAP) HoldGraphResume() { g.holdResume = true }
-
-func (g *graphMailboxIMAP) AcceptGraphPage() {
-	g.holdResume = false
-	if g.pendingURL != "" {
-		g.cursor.DeltaLink = g.pendingURL
-		g.checkpoint.URL = g.pendingURL
-	}
-	g.checkpoint.PoisonID = ""
-	g.checkpoint.PoisonCount = 0
-	g.omitPoison = ""
-}
-
-func (g *graphMailboxIMAP) EstablishBaseline(ctx context.Context, pageSize int) (bool, error) {
-	if ctx == nil {
-		ctx = g.opCtx()
-	}
-	if g.checkpoint.NotBefore.IsZero() {
-		g.checkpoint.NotBefore = time.Now().UTC()
-	}
-	cursor, done, err := g.box.baselinePage(ctx, g.cursor, pageSize)
-	if err != nil {
-		return false, err
-	}
-	g.cursor = cursor
-	g.pendingURL = cursor.DeltaLink
-	g.checkpoint.URL = cursor.DeltaLink
-	g.checkpoint.Folder = g.folder
-	g.holdResume = false
-	return done, nil
-}
-
-func (g *graphMailboxIMAP) FetchMessages(_ uint32, batchSize int) ([]*FetchedMessage, error) {
-	messages, cursor, err := g.box.poll(g.opCtx(), g.cursor, batchSize, g.checkpoint.NotBefore, g.omitPoison)
-	if err != nil {
-		return nil, err
-	}
-	g.pendingURL = cursor.DeltaLink
-	g.cursor = cursor
-	g.ids = g.box.idsByUID
-	g.alreadyRead = g.box.readByUID
-	return messages, nil
-}
-
-func (g *graphMailboxIMAP) graphID(uid uint32) (string, error) {
-	id := g.ids[uid]
-	if id == "" {
-		return "", fmt.Errorf("graph message for uid %d is not in the last poll", uid)
-	}
-	return id, nil
-}
-
-func (g *graphMailboxIMAP) MarkAsRead(uid uint32) error {
-	if g.alreadyRead[uid] {
-		return nil
-	}
-	id, err := g.graphID(uid)
-	if err != nil {
-		return err
-	}
-	return g.box.MarkRead(g.opCtx(), id)
-}
-
-func (g *graphMailboxIMAP) DeleteMessage(uid uint32) error {
-	id, err := g.graphID(uid)
-	if err != nil {
-		return err
-	}
-	return g.box.Delete(g.opCtx(), id)
-}
-
-func (g *graphMailboxIMAP) Expunge() error { return nil }
-func (g *graphMailboxIMAP) Close() error   { return nil }
 
 const graphCheckpointVersion = "ws-graph-v1"
 

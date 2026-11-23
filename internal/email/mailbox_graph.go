@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"time"
+
+	"windshift/internal/mailbox"
 )
 
 // graphMailbox adapts a GraphMailbox to Mailbox. It carries no IMAP concepts:
@@ -25,27 +27,33 @@ type graphMailbox struct {
 }
 
 // NewGraphMailbox wraps a Graph mailbox reader as a Mailbox.
-func NewGraphMailbox(box *GraphMailbox) Mailbox {
+func NewGraphMailbox(box *GraphMailbox) mailbox.Mailbox {
 	return &graphMailbox{box: box}
 }
 
-func (g *graphMailbox) Open(ctx context.Context, scope string) (MailboxInfo, error) {
+func (g *graphMailbox) Open(ctx context.Context, scope string, _ bool) (mailbox.Info, error) {
 	g.cursor = GraphMailboxCursor{}
 	g.committed = GraphMailboxCursor{}
 	g.holdResume = false
 	g.omitPoison = ""
 	if err := g.box.bindFolder(ctx, scope); err != nil {
-		return MailboxInfo{}, err
+		return mailbox.Info{}, err
 	}
 	g.folder = g.box.folder
+	// The restored checkpoint may belong to another folder. Resuming it would
+	// keep polling the previous folder, so drop it now that the scope is known.
+	if g.checkpoint.Folder != "" && g.checkpoint.Folder != g.folder {
+		g.folderMismatch = true
+		g.checkpoint = graphCheckpoint{Folder: g.folder}
+	}
 	// Graph resumes from a delta link rather than a position in a mailbox, so
 	// there is no "existing history" concept to skip. A new intake opts into
 	// history by starting from an empty link, and into a baseline by calling
 	// Seed.
-	return MailboxInfo{HasExisting: false}, nil
+	return mailbox.Info{HasExisting: false}, nil
 }
 
-func (g *graphMailbox) Fetch(ctx context.Context, batch int) ([]Delivery, error) {
+func (g *graphMailbox) Fetch(ctx context.Context, batch int) ([]mailbox.Delivery, error) {
 	// The baseline cutoff and the exhausted-poison id must reach the delta
 	// round: without them a primed mailbox re-ingests skipped history and a
 	// poison message is retried forever.
@@ -54,14 +62,19 @@ func (g *graphMailbox) Fetch(ctx context.Context, batch int) ([]Delivery, error)
 		return nil, err
 	}
 	g.cursor = cursor
-	deliveries := make([]Delivery, 0, len(messages))
+	deliveries := make([]mailbox.Delivery, 0, len(messages))
 	for _, msg := range messages {
-		deliveries = append(deliveries, Delivery{Ref: msg.Ref, Message: msg})
+		deliveries = append(deliveries, mailbox.Delivery{Ref: msg.Ref, Message: msg})
 	}
 	return deliveries, nil
 }
 
 func (g *graphMailbox) MarkRead(ctx context.Context, ref string) error {
+	// A message the delta round already reported as read needs no PATCH; the
+	// legacy adapter suppressed this the same way.
+	if g.box.readByID[ref] {
+		return nil
+	}
 	return g.box.MarkRead(ctx, ref)
 }
 

@@ -5,71 +5,9 @@ import (
 	"fmt"
 	"strconv"
 
+	"windshift/internal/mailbox"
 	"windshift/internal/mailmsg"
-	"windshift/internal/models"
 )
-
-// Delivery is one message handed to the intake poller, tagged with the
-// reference its transport uses to address it later. IMAP refs are the decimal
-// UID; a Graph ref is the immutable Graph message id. The ref is stable for the
-// life of the mailbox, unlike the per-poll ordinals the IMAP-shaped Graph
-// adapter still invents for the legacy Poll path.
-type Delivery struct {
-	Ref     string
-	Message *mailmsg.Message
-}
-
-// MailboxInfo describes what Open found.
-type MailboxInfo struct {
-	// HasExisting reports that the mailbox already holds messages, so a new
-	// intake must choose between importing history and skipping to the end.
-	HasExisting bool
-}
-
-// Mailbox is the transport-neutral surface an intake poller drives. It is
-// deliberately not IMAP: there is no UID space, UIDVALIDITY, or UIDNEXT here,
-// because a Graph or Teams mailbox has none of those. Each transport keeps its
-// cursor semantics behind Checkpoint/Restore.
-//
-// A transport that can skip a mailbox's existing history implements
-// MailboxSeeder; one with a poison tracker implements MailboxPoisoner. Both are
-// Graph-shaped recovery concerns and stay optional, so an IMAP mailbox does not
-// have to pretend to support them.
-type Mailbox interface {
-	Open(ctx context.Context, scope string) (MailboxInfo, error)
-	Fetch(ctx context.Context, batch int) ([]Delivery, error)
-	MarkRead(ctx context.Context, ref string) error
-	Delete(ctx context.Context, ref string) error
-	Expunge(ctx context.Context) error
-	// Checkpoint returns the opaque value to persist for the next tick. It
-	// advances only after Acknowledge, so a batch that stops early resumes where
-	// it stopped instead of skipping the messages it never processed.
-	Checkpoint() string
-	Restore(checkpoint string)
-	Acknowledge()
-	Close() error
-}
-
-// MailboxSeeder is implemented by transports that advance past existing history
-// without downloading it. One call acknowledges at most one page; done reports
-// that there is nothing left to prime.
-type MailboxSeeder interface {
-	Seed(ctx context.Context, batch int) (done bool, err error)
-}
-
-// MailboxPoisoner tracks a message that repeatedly fails to fetch or process.
-// It is Graph-only: an IMAP mailbox pins the failure on failed_message_uid.
-type MailboxPoisoner interface {
-	Poison() (ref string, count int, ok bool)
-	SetPoison(ref string, count int)
-	OmitExhausted(max int)
-}
-
-// MailboxProvider is optionally implemented by providers that build a native
-// Mailbox. Providers that do not are wrapped from their IMAPClient.
-type MailboxProvider interface {
-	OpenMailbox(ctx context.Context, config *models.ChannelConfig) (Mailbox, error)
-}
 
 // imapMailbox adapts an IMAP client to Mailbox. UIDs, UIDVALIDITY, and UIDNEXT
 // stay inside this type: the checkpoint is the highest consumed UID and the
@@ -90,33 +28,49 @@ type imapMailbox struct {
 
 // NewIMAPMailbox wraps an IMAP client as a Mailbox. It does not connect; the
 // caller supplies a connected client, exactly as the poller did before.
-func NewIMAPMailbox(client IMAPClient) Mailbox {
+func NewIMAPMailbox(client IMAPClient) mailbox.Mailbox {
 	return &imapMailbox{client: client}
 }
 
-func (m *imapMailbox) Open(ctx context.Context, scope string) (MailboxInfo, error) {
+func (m *imapMailbox) Open(ctx context.Context, scope string, skipExisting bool) (mailbox.Info, error) {
 	if err := ctx.Err(); err != nil {
-		return MailboxInfo{}, err
+		return mailbox.Info{}, err
 	}
 	selectData, err := m.client.SelectMailbox(scope)
 	if err != nil {
-		return MailboxInfo{}, err
+		return mailbox.Info{}, err
+	}
+	if scope != m.scope {
+		// One mailbox drives several intakes. A cursor from the previous folder
+		// must not leak into this one.
+		m.nextUID = 0
+		m.committedUID = 0
 	}
 	m.scope = scope
-	if selectData != nil {
-		// A changed UIDVALIDITY means the server renumbered the mailbox, so a
-		// cursor from the old UID space would skip or replay mail.
-		if m.validity != 0 && selectData.UIDValidity != 0 && selectData.UIDValidity != m.validity {
-			m.nextUID = 0
-			m.committedUID = 0
-		}
-		m.validity = selectData.UIDValidity
-		m.hasHistory = selectData.UIDNext > 1
+	if selectData == nil {
+		return mailbox.Info{}, nil
 	}
-	return MailboxInfo{HasExisting: m.hasHistory}, nil
+	// A changed UIDVALIDITY means the server renumbered the mailbox, so a
+	// cursor and dedup keys from the old UID space would skip or replay mail.
+	if m.validity != 0 && selectData.UIDValidity != 0 && selectData.UIDValidity != m.validity {
+		m.nextUID = 0
+		m.committedUID = 0
+	}
+	m.validity = selectData.UIDValidity
+	m.hasHistory = selectData.UIDNext > 1
+	if skipExisting && selectData.UIDNext > 1 {
+		// Start after the newest existing message. The old poller expressed this
+		// as sinceUID = UIDNext-1; keeping it inside the mailbox means the
+		// scheduler never has to reason about UID arithmetic. The position is
+		// committed immediately: skipping history is itself an acknowledged
+		// decision, and a crash before the first message must not re-import.
+		m.nextUID = uint32(selectData.UIDNext - 1)
+		m.committedUID = m.nextUID
+	}
+	return mailbox.Info{HasExisting: m.hasHistory, Validity: m.validity}, nil
 }
 
-func (m *imapMailbox) Fetch(ctx context.Context, batch int) ([]Delivery, error) {
+func (m *imapMailbox) Fetch(ctx context.Context, batch int) ([]mailbox.Delivery, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -124,12 +78,12 @@ func (m *imapMailbox) Fetch(ctx context.Context, batch int) ([]Delivery, error) 
 	if err != nil {
 		return nil, err
 	}
-	deliveries := make([]Delivery, 0, len(messages))
+	deliveries := make([]mailbox.Delivery, 0, len(messages))
 	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
-		deliveries = append(deliveries, Delivery{
+		deliveries = append(deliveries, mailbox.Delivery{
 			Ref:     strconv.FormatUint(uint64(msg.UID), 10),
 			Message: &mailmsg.Message{Ref: strconv.FormatUint(uint64(msg.UID), 10), Raw: msg.Raw, FetchError: msg.FetchError},
 		})
@@ -201,12 +155,27 @@ func (m *imapMailbox) Restore(checkpoint string) {
 // cursor. It is not a no-op even for IMAP, because a batch can stop early.
 func (m *imapMailbox) Acknowledge() { m.committedUID = m.nextUID }
 
+// CommittedUID reports the last acknowledged IMAP UID so a caller that still
+// stores numeric watermarks can keep them in step with the opaque checkpoint.
+// It returns 0 for a legacy Graph-compatible client, which has no UID space.
+func (m *imapMailbox) CommittedUID() uint32 { return m.committedUID }
+
 func (m *imapMailbox) Close() error {
 	if m.closed {
 		return nil
 	}
 	m.closed = true
 	return m.client.Close()
+}
+
+// EncodeIMAPCheckpoint renders an IMAP cursor so a caller that stores numeric
+// watermarks (or one migrating from them) can feed it back through
+// Mailbox.Restore unchanged.
+func EncodeIMAPCheckpoint(validity uint32, lastUID uint32) string {
+	if lastUID == 0 {
+		return ""
+	}
+	return fmt.Sprintf("imap-v1:%d:%d", validity, lastUID)
 }
 
 func parseIMAPCheckpoint(raw string) (uint32, uint32, bool) {
