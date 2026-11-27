@@ -99,6 +99,12 @@ func (d *graphBaselineDB) QueryContext(context.Context, string, ...any) (*sql.Ro
 func (d *graphBaselineDB) QueryRowContext(context.Context, string, ...any) *sql.Row {
 	return nil
 }
+func (d *graphBaselineDB) QueryReadContext(context.Context, string, ...any) (*sql.Rows, error) {
+	return nil, nil
+}
+func (d *graphBaselineDB) QueryRowReadContext(context.Context, string, ...any) *sql.Row {
+	return nil
+}
 func (d *graphBaselineDB) ExecContext(context.Context, string, ...any) (sql.Result, error) {
 	return nil, nil
 }
