@@ -4017,8 +4017,7 @@ END $$;
 			DROP INDEX IF EXISTS idx_items_workspace_frac_index_active;
 			ALTER INDEX idx_items_workspace_frac_index_active_new RENAME TO idx_items_workspace_frac_index_active;
 		`,
-	}}
-},
+	},
 	{
 		Version:       "20261117_intake_graph_delta",
 		Name:          "Persist the Graph delta link per email intake",
@@ -4027,7 +4026,7 @@ END $$;
 		SQLite:        `ALTER TABLE email_intake_state ADD COLUMN graph_delta_link TEXT NOT NULL DEFAULT ''`,
 		Postgres:      `ALTER TABLE email_intake_state ADD COLUMN IF NOT EXISTS graph_delta_link TEXT NOT NULL DEFAULT ''`,
 	},
-}c349cc3 (Independent-Microsoft-Graph-channel)
+ }
 
 const jiraCSVPeopleSQL = `CREATE TABLE IF NOT EXISTS jira_csv_people (
 	source_ref TEXT PRIMARY KEY,
